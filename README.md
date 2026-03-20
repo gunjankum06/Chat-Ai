@@ -1,4 +1,4 @@
-# CLI-LLM-MCP-CHAT
+# Chat-Ai
 
 A reference implementation of an **MCP host application** that pairs a CLI front-end with a pluggable LLM backend and an MCP tool server. The agent follows a strict request/response loop:
 
@@ -45,7 +45,7 @@ The LLM is asked to decide on every turn whether to call a tool or answer direct
 ## Project Structure
 
 ```
-CLI-LLM-MCP-CHAT/
+Chat-Ai/
 ├── main.py                      # Entry point
 ├── requirements.txt             # Runtime dependencies
 ├── .env.example                 # Template for environment variables

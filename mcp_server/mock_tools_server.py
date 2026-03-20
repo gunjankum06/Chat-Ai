@@ -1,6 +1,6 @@
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("python-mcp-flow-demo")
+mcp = FastMCP("Chat-Ai")
 
 @mcp.tool()
 def greet(name: str) -> str:
