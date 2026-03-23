@@ -29,9 +29,10 @@ class MockLLM(LLMClient):
             name = m.group(1).strip()
             return json.dumps({"type": "tool_call", "name": "greet", "arguments": {"name": name}})
 
-        m = re.search(r"defect\s+(\d+)", user, re.IGNORECASE)
+        # Match "defect 123", "get 123 details", "get defect 123", etc.
+        m = re.search(r"(?:defect\s+(\d+)|get\s+(?:defect\s+)?(\d+))", user, re.IGNORECASE)
         if m:
-            defect_id = m.group(1)
+            defect_id = m.group(1) or m.group(2)
             return json.dumps({"type": "tool_call", "name": "get_defect_details", "arguments": {"defectId": defect_id}})
 
         # default: no tool
