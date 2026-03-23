@@ -18,15 +18,17 @@ class TestMockLLM(unittest.IsolatedAsyncioTestCase):
         """When a tool result is the last message, MockLLM must return a final
         answer rather than looping back into another tool call."""
         llm = MockLLM()
-        tool_content = json.dumps({"content": "Hello Gunjan! This result came from an MCP tool."})
+        # The orchestrator now strips MCP content blocks to plain text before
+        # appending the tool message, so content here is a clean string.
+        tool_text = "Hello Gunjan! This result came from an MCP tool."
         messages = [
             {"role": "user", "content": "greet Gunjan"},
-            {"role": "tool", "name": "greet", "content": tool_content},
+            {"role": "tool", "name": "greet", "content": tool_text},
         ]
         raw = await llm.complete(messages)
         obj = json.loads(raw)
         self.assertEqual(obj["type"], "final")
-        self.assertIn("Gunjan", obj["content"])
+        self.assertEqual(obj["content"], tool_text)
 
 
 if __name__ == "__main__":

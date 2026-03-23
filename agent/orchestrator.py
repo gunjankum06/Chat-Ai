@@ -130,11 +130,19 @@ class AgentOrchestrator:
                 })
                 continue
 
-            # attach tool result to messages for next LLM turn
+            # Extract plain text from MCP content blocks for the LLM
+            text_parts = [
+                block.text
+                for block in (tool_result.content or [])
+                if hasattr(block, "text")
+            ]
+            tool_text = "\n".join(text_parts) if text_parts else json.dumps(
+                tool_result.model_dump(mode="json"), ensure_ascii=False
+            )
             messages.append({
                 "role": "tool",
                 "name": tool_name,
-                "content": json.dumps(tool_result.model_dump(), ensure_ascii=False)
+                "content": tool_text,
             })
 
         return f"I tried calling tools up to {self.max_tool_steps} times but couldn't finish. Please refine your request."

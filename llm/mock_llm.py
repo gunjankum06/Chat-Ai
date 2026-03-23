@@ -11,16 +11,11 @@ class MockLLM(LLMClient):
       - Otherwise, final.
     """
     async def complete(self, messages: List[Dict[str, Any]]) -> str:
-        # If the last message is a tool result, return it as the final answer.
+        # If the last message is a tool result, return its content as the final answer.
         last = messages[-1] if messages else {}
         if last.get("role") == "tool":
-            tool_content = last.get("content", "")
-            try:
-                result = json.loads(tool_content)
-                answer = result if not isinstance(result, dict) else result.get("content", tool_content)
-            except (json.JSONDecodeError, KeyError):
-                answer = tool_content
-            return json.dumps({"type": "final", "content": str(answer)})
+            answer = last.get("content", "(no result)")
+            return json.dumps({"type": "final", "content": answer})
 
         # Find the last user message to decide which tool to call.
         user = ""
