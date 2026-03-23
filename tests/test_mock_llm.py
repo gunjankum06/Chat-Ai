@@ -14,17 +14,19 @@ class TestMockLLM(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(obj["name"], "greet")
         self.assertEqual(obj["arguments"], {"name": "Gunjan"})
 
-    async def test_reads_last_user_not_tool(self):
+    async def test_returns_final_after_tool_result(self):
+        """When a tool result is the last message, MockLLM must return a final
+        answer rather than looping back into another tool call."""
         llm = MockLLM()
+        tool_content = json.dumps({"content": "Hello Gunjan! This result came from an MCP tool."})
         messages = [
-            {"role": "user", "content": "get defect 1234 details"},
-            {"role": "tool", "name": "get_defect_details", "content": "{}"},
+            {"role": "user", "content": "greet Gunjan"},
+            {"role": "tool", "name": "greet", "content": tool_content},
         ]
         raw = await llm.complete(messages)
         obj = json.loads(raw)
-        self.assertEqual(obj["type"], "tool_call")
-        self.assertEqual(obj["name"], "get_defect_details")
-        self.assertEqual(obj["arguments"], {"defectId": "1234"})
+        self.assertEqual(obj["type"], "final")
+        self.assertIn("Gunjan", obj["content"])
 
 
 if __name__ == "__main__":
