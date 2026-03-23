@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import logging
+import os
 import sys
 from dotenv import load_dotenv
 
@@ -17,6 +19,10 @@ def parse_args():
 
 async def main():
     load_dotenv()
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     args = parse_args()
 
     orchestrator = AgentOrchestrator(server_command=args.server)

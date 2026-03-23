@@ -11,7 +11,11 @@ class MockLLM(LLMClient):
       - Otherwise, final.
     """
     async def complete(self, messages: List[Dict[str, Any]]) -> str:
-        user = messages[-1]["content"].strip()
+        user = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                user = str(msg.get("content", "")).strip()
+                break
 
         m = re.match(r"greet\s+(.+)$", user, re.IGNORECASE)
         if m:
