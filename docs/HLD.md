@@ -299,6 +299,285 @@ Risk: Long prompts exceed model context.
 Risk: Tool misuse due to poor prompt grounding.
 - Mitigation: explicit tool schema injection and deterministic prompt policies.
 
+---
+
+## 17. Guardrails Integration Design (guardrails-ai)
+
+### 17.1 Overview and Motivation
+
+Guardrails-ai (`guardrails-ai` Python package) is a framework that wraps LLM calls and data flows with declarative validation pipelines. Unlike hand-written `if/else` checks, it provides:
+
+- **Validators**: reusable, composable, testable functions that assert properties on strings or structured data.
+- **Guard objects**: an execution wrapper that runs validators before and/or after an LLM call, or on arbitrary data.
+- **Hub validators**: a registry of community and enterprise-grade validators (toxic language, PII detection, regex patterns, JSON schema conformance, etc.) installable via `guardrails hub install`.
+- **Fix-up actions**: on validation failure, guards can choose to `NOOP` (pass-through), `FILTER` (remove), `REASK` (retry the LLM with a correction prompt), or `EXCEPTION` (raise hard error).
+- **ValidationOutcome**: a structured result object containing the validated output, raw output, validation errors, and whether the guard passed or failed.
+
+In Chat-Ai, guardrails-ai will be introduced as a dedicated **Guardrails Layer** sitting between user input, LLM output, tool call arguments, tool results, and final answers. This layer is the authoritative enforcement boundary for safety, correctness, and policy compliance.
+
+---
+
+### 17.2 Threat Model and What Guardrails Defends Against
+
+The following threats are in scope for the guardrails layer:
+
+| Threat | Entry Point | Description |
+|---|---|---|
+| Direct prompt injection | User CLI input | User crafts input to hijack the system prompt or override agent behavior |
+| Indirect prompt injection | Tool result (MCP) | External data (e.g. ADO work item title/description) contains injected instructions |
+| LLM hallucination / schema violation | LLM output | LLM returns JSON that does not conform to the LLMDecision contract |
+| Toxic or inappropriate input | User CLI input | User sends offensive, harmful, or policy-violating content |
+| PII leakage in output | Final LLM answer | LLM references personal data from ADO work items in its visible reply |
+| Unauthorized tool invocation | LLM decision | LLM fabricates a tool name not registered in the MCP session |
+| Oversized payload DoS | Any layer | Extremely large strings passed into prompts or tool calls |
+| Sensitive credential exposure | Tool result / logs | ADO API response containing tokens or credentials echoed to user |
+
+---
+
+### 17.3 Guardrails Layer Position in Architecture
+
+The updated runtime flow with guardrails inserted:
+
+```
+User Input (CLI)
+    │
+    ▼
+[Guard: InputGuard]          ← Step 1: validate/sanitize user text
+    │
+    ▼
+Orchestrator → LLM.complete()
+    │
+    ▼
+[Guard: LLMOutputGuard]      ← Step 2: validate LLM JSON structure + content
+    │
+    ▼
+Pydantic LLMDecision validate_decision()
+    │
+    ▼
+[Guard: ToolCallGuard]       ← Step 3: validate tool name allowlist + argument safety
+    │
+    ▼
+MCP session.call_tool()
+    │
+    ▼
+[Guard: ToolResultGuard]     ← Step 4: sanitize tool result before re-injecting into prompt
+    │
+    ▼
+Orchestrator builds final_text
+    │
+    ▼
+[Guard: OutputGuard]         ← Step 5: validate final answer for PII, toxicity, length
+    │
+    ▼
+Console output to user
+```
+
+Each guard is a separate `Guard` instance defined in a new module `agent/guardrails.py`. Guards are constructed at orchestrator startup and reused across turns.
+
+---
+
+### 17.4 Guard Definitions (Per Layer)
+
+#### Guard 1 — InputGuard
+
+**Purpose:** Validate all raw user text before it enters the message history.
+
+**Validators to apply:**
+- `guardrails-hub: ToxicLanguage` — detect hate speech, harassment, and harmful content using an NLP classifier.
+- `guardrails-hub: DetectPII` (optional) — warn or block if the user submits PII that should not be processed.
+- Custom `PromptInjectionValidator` — regex + semantic pattern match for phrases like "ignore previous instructions", "you are now", "new system prompt", "disregard all" with configurable severity.
+- Custom `InputLengthValidator` — enforce maximum character limit (e.g. 2000 chars) to prevent context-stuffing attacks.
+
+**Failure action:** `EXCEPTION` — immediately surface a user-visible error, do not append to message history.
+
+**Reask:** Not applicable for input guard (no LLM involved).
+
+---
+
+#### Guard 2 — LLMOutputGuard
+
+**Purpose:** Validate the raw string returned by the LLM before it is JSON-parsed and fed to `validate_decision()`.
+
+**Validators to apply:**
+- `guardrails-hub: ValidJson` — assert the output is parseable JSON before any further processing.
+- Custom `LLMDecisionSchemaValidator` — assert the parsed JSON conforms to the `LLMDecision` Pydantic schema (`type`, `name`, `arguments`, `content` fields with correct types).
+- Custom `AuthorizedToolValidator` — if `type == "tool_call"`, assert `name` is in the set of tools registered in the current MCP session.
+- Custom `OutputLengthValidator` — reject responses over a configurable byte limit (e.g. 10,000 chars) to guard against runaway generation.
+
+**Failure action:** `REASK` (up to 1 retry) — if the LLM output is invalid JSON or wrong schema, append a correction instruction to messages and repeat the LLM call once. If retry also fails, `EXCEPTION`.
+
+**Why REASK here:** The LLM may have accidentally emitted markdown fences or extra text around valid JSON. A single structured retry prompt ("Your last response was not valid JSON. Respond only with the JSON object.") typically recovers the model without losing context.
+
+---
+
+#### Guard 3 — ToolCallGuard
+
+**Purpose:** Validate the tool name and arguments extracted from the LLM decision before calling `session.call_tool()`.
+
+**Validators to apply:**
+- Custom `AllowlistToolNameValidator` — hard-block any tool name not in the MCP-discovered tool catalog.
+- Custom `ArgumentSizeValidator` — serialize `arguments` to JSON and assert total size is under a configurable limit (e.g. 5,000 chars).
+- Custom `ArgumentInjectionValidator` — scan string values within `arguments` for prompt injection patterns (defense against the LLM trying to inject instructions through tool parameters).
+- Custom `ArgTypeConformanceValidator` — assert argument values conform to the MCP tool's `inputSchema` JSON Schema definition.
+
+**Failure action:** `EXCEPTION` — do not call the tool; inject a `role=tool` error message into history so the LLM can recover gracefully.
+
+---
+
+#### Guard 4 — ToolResultGuard
+
+**Purpose:** Sanitize the raw text returned by MCP tool execution before it is appended to the conversation as a `role=tool` message.
+
+This is the most security-critical guard because external data (ADO work item titles, descriptions, comments) re-enters the LLM prompt context here. An attacker who controls ADO content could embed injected instructions in a work item description.
+
+**Validators to apply:**
+- Custom `IndirectInjectionDetector` — scan returned text for known injection phrases and patterns. On detection, redact the suspicious segment and log a warning.
+- Custom `CredentialLeakDetector` — regex scan for patterns resembling API keys, tokens (`Bearer ...`), or PAT-shaped strings. Redact on match.
+- Custom `ResultSizeValidator` — truncate or reject results exceeding a configurable character limit (e.g. 8,000 chars) to prevent prompt overflow.
+- `guardrails-hub: DetectPII` (optional) — detect PII in tool results, either redact or flag before the LLM sees it.
+
+**Failure action:** `FILTER` — replace suspicious content with a safe placeholder (`[redacted by guardrail]`) rather than blocking the entire turn, allowing the LLM to continue with degraded but safe data.
+
+---
+
+#### Guard 5 — OutputGuard
+
+**Purpose:** Validate the final `content` string produced by the LLM before printing it to the user.
+
+**Validators to apply:**
+- `guardrails-hub: ToxicLanguage` — the LLM should not emit toxic or harmful text in its final reply.
+- `guardrails-hub: DetectPII` — if the answer references personal data extracted from ADO, optionally redact or warn before surface to the CLI user.
+- Custom `OutputLengthGuard` — truncate or page final responses exceeding a display limit (e.g. 5,000 chars).
+- Custom `SensitiveKeywordFilter` — block any final response that mentions internal project-sensitive keywords (configurable list loaded from environment or config file).
+
+**Failure action:** `FILTER` on PII fields; `EXCEPTION` on toxicity detection.
+
+---
+
+### 17.5 New Module and File Structure
+
+The following new files will be introduced:
+
+```
+agent/
+    guardrails.py          ← Guard factory: instantiates and configures all 5 guards
+    validators/
+        __init__.py
+        input_validators.py        ← PromptInjectionValidator, InputLengthValidator
+        llm_output_validators.py   ← LLMDecisionSchemaValidator, AuthorizedToolValidator, OutputLengthValidator
+        tool_call_validators.py    ← AllowlistToolNameValidator, ArgumentSizeValidator, ArgumentInjectionValidator, ArgTypeConformanceValidator
+        tool_result_validators.py  ← IndirectInjectionDetector, CredentialLeakDetector, ResultSizeValidator
+        output_validators.py       ← OutputLengthGuard, SensitiveKeywordFilter
+```
+
+`agent/guardrails.py` will expose a `GuardrailsManager` class that:
+- Is constructed once in `AgentOrchestrator.__init__()`.
+- Holds references to all 5 `Guard` instances.
+- Exposes typed methods: `validate_input()`, `validate_llm_output()`, `validate_tool_call()`, `validate_tool_result()`, `validate_output()`.
+- Centralizes configuration (limits, patterns, allowed tools list) from environment variables or a config file.
+
+---
+
+### 17.6 Integration Points in Orchestrator
+
+The orchestrator (`agent/orchestrator.py`) integrates the guardrails manager at the following call sites:
+
+| Orchestrator location | GuardrailsManager method called |
+|---|---|
+| `run_cli()` after `console.input()` | `validate_input(user_text)` |
+| `_run_agent_loop()` after `llm.complete()` | `validate_llm_output(raw, allowed_tools)` |
+| `_run_agent_loop()` before `session.call_tool()` | `validate_tool_call(tool_name, tool_args, allowed_tools)` |
+| `_run_agent_loop()` after tool result extraction | `validate_tool_result(tool_text)` |
+| `run_cli()` before `console.print(final_text)` | `validate_output(final_text)` |
+
+All methods raise `GuardrailViolationError` (a custom exception) on hard block, or return a (possibly modified) safe string on `FILTER` action.
+
+---
+
+### 17.7 New Dependencies
+
+```
+guardrails-ai>=0.5          # core framework
+guardrails-hub              # CLI tool to install Hub validators
+```
+
+Hub validators to install at setup time (via `guardrails hub install <validator>`):
+- `guardrails/toxic_language`
+- `guardrails/detect_pii`
+- `guardrails/valid_json`
+
+These are installed into the local project environment, not globally, and pinned via `requirements.txt`.
+
+---
+
+### 17.8 Configuration Model (New Environment Variables)
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GUARDRAILS_INPUT_MAX_LENGTH` | Max chars for user input | `2000` |
+| `GUARDRAILS_RESULT_MAX_LENGTH` | Max chars for tool result fed to LLM | `8000` |
+| `GUARDRAILS_OUTPUT_MAX_LENGTH` | Max chars for final answer shown to user | `5000` |
+| `GUARDRAILS_LLM_OUTPUT_MAX_LENGTH` | Max chars for raw LLM response | `10000` |
+| `GUARDRAILS_LLM_REASK_ENABLED` | Enable single REASK retry on bad LLM JSON | `true` |
+| `GUARDRAILS_TOXIC_LANGUAGE_ENABLED` | Enable toxic language checks (input + output) | `true` |
+| `GUARDRAILS_PII_DETECTION_ENABLED` | Enable PII detection in tool results + output | `false` |
+| `GUARDRAILS_SENSITIVE_KEYWORDS` | Comma-separated list of blocked keywords in output | `` (empty) |
+| `GUARDRAILS_LOG_VIOLATIONS` | Write all violations to application log | `true` |
+
+---
+
+### 17.9 Guard Failure Handling and User Experience
+
+- **Hard block (EXCEPTION):** The current turn is aborted. The user sees a clear, user-friendly message (e.g. `[Guardrail] Input blocked: potential injection pattern detected.`). The message is NOT added to conversation history.
+- **Filter (FILTER):** Content is redacted and processing continues. The LLM sees redacted content. The user may see `[redacted]` in the assistant's answer if the LLM references the filtered content.
+- **Reask (REASK):** Transparent to the user. A correction prompt is silently appended and the LLM is called again. Max 1 reask attempt to avoid latency loops.
+- **All violations** are logged at `WARNING` level with context (which guard, which validator, the pattern or reason) for observability and audit.
+
+---
+
+### 17.10 Security Properties Gained
+
+After guardrails-ai integration:
+
+| Property | Before | After |
+|---|---|---|
+| Prompt injection prevention | None | InputGuard + ToolResultGuard |
+| LLM output schema enforcement | Pydantic only (crash on bad data) | Guard REASK + Pydantic (graceful recovery) |
+| Unauthorized tool call prevention | None | ToolCallGuard allowlist |
+| Indirect injection via ADO data | None | ToolResultGuard IndirectInjectionDetector |
+| Toxic content filtering | None | Hub ToxicLanguage at input + output |
+| PII leakage prevention | None | Hub DetectPII at tool result + output |
+| Credential redaction in tool results | None | CredentialLeakDetector |
+| Audit trail of violations | None | Structured log at WARNING level |
+
+---
+
+### 17.11 Testing Strategy for Guardrails
+
+New tests to be added in `tests/`:
+
+- `tests/test_guardrails_input.py`: unit tests for each input validator; test injection patterns, length limits, and pass-through of clean input.
+- `tests/test_guardrails_llm_output.py`: test valid/invalid JSON, schema-conformant and non-conformant decisions, oversized output, unauthorized tool names.
+- `tests/test_guardrails_tool_call.py`: test allowlist enforcement, oversized args, and arg injection.
+- `tests/test_guardrails_tool_result.py`: test injection redaction, credential pattern detection, and result truncation.
+- `tests/test_guardrails_output.py`: test PII detection path, length truncation, and keyword filter.
+
+All validators should be unit-testable in isolation since `guardrails-ai` validators are plain Python callables.
+
+Integration tests in `tests/test_orchestrator_guardrails.py` should simulate end-to-end turn execution with both clean and adversarial inputs, verifying that `GuardrailViolationError` is raised at the correct layer and that filtered outputs are sanitized before reaching the console.
+
+---
+
+### 17.12 Phased Implementation Plan
+
+| Phase | Scope | Priority |
+|---|---|---|
+| Phase 1 | Install guardrails-ai; implement InputGuard (injection + length) and LLMOutputGuard (valid JSON + schema) | High |
+| Phase 2 | Implement ToolCallGuard (allowlist + arg size) and ToolResultGuard (indirect injection + credential redaction) | High |
+| Phase 3 | Implement OutputGuard (PII + length); integrate Hub validators (ToxicLanguage, DetectPII, ValidJson) | Medium |
+| Phase 4 | Add structured violation logging; wire all environment variable config; write full test suite | Medium |
+| Phase 5 | Evaluate Azure Content Safety API integration at InputGuard and OutputGuard for enterprise deployment | Low |
+
 ## 17. Future Architecture Roadmap
 
 Phase 1
