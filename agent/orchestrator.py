@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 from typing import List, Dict, Any
 
 from rich.console import Console
@@ -9,6 +10,7 @@ from rich.panel import Panel
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from agent.guardrails import Guardrails, GuardrailViolation
 from agent.prompts import SYSTEM_PROMPT, tools_to_compact_text
 from agent.util import safe_parse_llm_json, validate_decision
 
@@ -33,6 +35,8 @@ class AgentOrchestrator:
         self.max_tool_steps = int(os.getenv("MAX_TOOL_STEPS", "5"))
         self.max_history_messages = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
 
+        self.guardrails = Guardrails()
+
         provider = (os.getenv("LLM_PROVIDER") or "mock").lower().strip()
         if provider == "azure_openai":
             if AzureOpenAILLM is None:
@@ -52,6 +56,10 @@ class AgentOrchestrator:
     async def run_cli(self):
         # 1) start MCP server as subprocess via stdio
         cmd = self.server_command[0]
+        # On Windows, bare "python"/"python3" won't be found by asyncio subprocess;
+        # resolve it to the current interpreter's full path.
+        if cmd in ("python", "python3"):
+            cmd = sys.executable
         args = self.server_command[1:]
 
         server_params = StdioServerParameters(command=cmd, args=args, env=None)
@@ -80,6 +88,13 @@ class AgentOrchestrator:
                     if user.lower() in ("exit", "quit"):
                         break
 
+                    # --- input guardrail ---
+                    try:
+                        user = self.guardrails.check_input(user)
+                    except GuardrailViolation as exc:
+                        console.print(f"\n[bold red]Blocked:[/bold red] {exc}")
+                        continue
+
                     messages.append({"role": "user", "content": user})
 
                     try:
@@ -87,6 +102,9 @@ class AgentOrchestrator:
                     except Exception as exc:
                         logger.exception("Agent loop failed")
                         final_text = f"Sorry, something went wrong: {exc}"
+
+                    # --- output guardrail ---
+                    final_text = self.guardrails.check_output(final_text)
 
                     console.print(f"\n[bold green]Assistant>[/bold green] {final_text}")
                     messages.append({"role": "assistant", "content": final_text})
@@ -117,6 +135,18 @@ class AgentOrchestrator:
             # tool call
             tool_name = decision.name or ""
             tool_args = decision.arguments or {}
+
+            # --- tool-call guardrail ---
+            try:
+                self.guardrails.check_tool_call(tool_name, tool_args)
+            except GuardrailViolation as exc:
+                logger.warning("Tool call blocked by guardrail: %s", exc)
+                messages.append({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"error": f"Tool call blocked: {exc}"}, ensure_ascii=False),
+                })
+                continue
 
             # call MCP tool
             try:

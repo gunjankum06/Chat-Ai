@@ -8,6 +8,8 @@ CLI → LLM → (tool call?) → MCP Server → LLM → CLI
 
 The LLM is asked to decide on every turn whether to call a tool or answer directly. It responds in a strict JSON schema (`tool_call` or `final`). The orchestrator interprets the decision, calls the MCP server when needed, and feeds the result back into the conversation until a final answer is produced.
 
+Every message passing through the pipeline is protected by **[guardrails-ai](https://github.com/guardrails-ai/guardrails)** at three enforcement points — user input, tool-call arguments, and final output — using hub validators for length limits, prompt-injection detection, and toxic-language filtering.
+
 ---
 
 ## Architecture
@@ -27,6 +29,7 @@ The LLM is asked to decide on every turn whether to call a tool or answer direct
 │   - Discovers available tools via list_tools()                  │
 │   - Runs the interactive CLI loop                               │
 │   - Runs the inner agent loop (LLM ↔ MCP until "final")         │
+│   - Applies guardrails at 3 points via agent/guardrails.py      │
 └──────────┬──────────────────────────────────────┬───────────────┘
            │                                      │
            ▼                                      ▼
@@ -38,6 +41,23 @@ The LLM is asked to decide on every turn whether to call a tool or answer direct
 │                     │              │   - greet(name)            │
 │   LLMClient ABC     │              │   - get_defect_details(id) │
 └─────────────────────┘              └────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   agent/guardrails.py  (guardrails-ai)          │
+│                                                                 │
+│  ① check_input()      ← user turn enters context               │
+│     - ValidLength     (max MAX_INPUT_LENGTH chars)              │
+│     - DetectPromptInjection                                     │
+│                                                                 │
+│  ② check_tool_call()  ← before MCP tool is executed            │
+│     - ALLOWED_TOOLS allowlist                                   │
+│     - ValidLength per argument (max MAX_ARG_LENGTH chars)       │
+│                                                                 │
+│  ③ check_output()     ← before answer is returned to user      │
+│     - ValidLength / auto-fix truncation (MAX_OUTPUT_LENGTH)     │
+│     - ToxicLanguage   (optional)                                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -52,6 +72,7 @@ Chat-Ai/
 ├── .gitignore
 ├── agent/
 │   ├── orchestrator.py          # Core agent loop (CLI ↔ LLM ↔ MCP)
+│   ├── guardrails.py            # guardrails-ai Guard wrappers (input / tool / output)
 │   ├── prompts.py               # System prompt + tool-text formatter
 │   ├── protocol.py              # Pydantic models: ToolCall, FinalAnswer, LLMDecision
 │   └── util.py                  # JSON parsing + LLMDecision validation helpers
@@ -140,6 +161,48 @@ All configuration is via `.env` (or real environment variables). Copy `.env.exam
 | `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | API version string |
 | `AZURE_OPENAI_DEPLOYMENT` | — | Deployment/model name (e.g. `gpt-4.1-mini`) |
 | `MAX_TOOL_STEPS` | `5` | Max tool-call iterations per user turn (safety guard) |
+| `MAX_HISTORY_MESSAGES` | `20` | Rolling window of non-system messages kept in context |
+| `MAX_INPUT_LENGTH` | `2000` | Max characters accepted from the user (guardrails-ai) |
+| `MAX_OUTPUT_LENGTH` | `8000` | Max characters in the assistant reply (guardrails-ai) |
+| `MAX_ARG_LENGTH` | `1000` | Max characters per tool argument value (guardrails-ai) |
+| `ALLOWED_TOOLS` | *(empty — all allowed)* | Comma-separated allowlist of permitted MCP tool names |
+| `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+---
+
+## Guardrails (guardrails-ai)
+
+The project uses the **[guardrails-ai](https://github.com/guardrails-ai/guardrails)** framework (`pip install guardrails-ai`) to enforce safety and quality policies at three points in every agent turn.
+
+### Enforcement Points
+
+| Point | Where | Validators used |
+|---|---|---|
+| **Input** | Before user message enters LLM context | `ValidLength`, `DetectPromptInjection` |
+| **Tool call** | Before MCP tool is executed | `ALLOWED_TOOLS` allowlist, `ValidLength` per argument |
+| **Output** | Before final answer is returned to user | `ValidLength` (auto-fix truncation), `ToxicLanguage` |
+
+### Hub Validators
+
+Install once with the guardrails CLI before running the agent:
+
+```bash
+guardrails hub install hub://guardrails/valid_length
+guardrails hub install hub://guardrails/detect_prompt_injection
+guardrails hub install hub://guardrails/toxic_language   # optional
+```
+
+> **Graceful degradation** — if a hub validator is not installed, `agent/guardrails.py` logs a warning and falls back to simple built-in checks so the agent continues to work.
+
+### Violation Behaviour
+
+| Violation | Result |
+|---|---|
+| Input too long or injection detected | Turn blocked; user sees a `Blocked:` message |
+| Tool not on `ALLOWED_TOOLS` list | Tool call skipped; LLM receives an error payload and may retry |
+| Tool argument too long | Same as above |
+| Output too long | Auto-truncated with a `[... response truncated]` notice |
+| Toxic output | Turn raises `GuardrailViolation`, user sees friendly error |
 
 ---
 
@@ -175,9 +238,19 @@ The LLM is instructed via `SYSTEM_PROMPT` to respond only in the strict JSON sch
 
 | Method | Description |
 |---|---|
-| `__init__(server_command)` | Selects LLM provider from env; stores MCP server command |
-| `run_cli()` | Spawns MCP subprocess, discovers tools, starts interactive loop |
-| `_run_agent_loop(session, messages)` | Iterates LLM ↔ tool calls until `type=final` or step limit |
+| `__init__(server_command)` | Selects LLM provider from env; instantiates `Guardrails`; stores MCP server command |
+| `run_cli()` | Spawns MCP subprocess, discovers tools, starts interactive loop; applies input + output guardrails |
+| `_run_agent_loop(session, messages)` | Iterates LLM ↔ tool calls until `type=final` or step limit; applies tool-call guardrail |
+
+### `agent/guardrails.py` — `Guardrails`
+
+Wrapper around the **guardrails-ai** `Guard` API. Builds one `Guard` per enforcement point at init time from installed hub validators.
+
+| Method | Validators | Behaviour on failure |
+|---|---|---|
+| `check_input(text)` | `ValidLength`, `DetectPromptInjection` | Raises `GuardrailViolation` |
+| `check_tool_call(name, arguments)` | Allowlist + `ValidLength` per arg | Raises `GuardrailViolation` |
+| `check_output(text)` | `ValidLength` (fix), `ToxicLanguage` | Truncates or raises `GuardrailViolation` |
 
 ### `agent/protocol.py`
 
@@ -234,6 +307,7 @@ A [FastMCP](https://github.com/jlowin/fastmcp) stdio server with two demo tools:
 | `python-dotenv` | Load `.env` file into environment |
 | `rich` | Terminal formatting (panels, colored prompts) |
 | `pydantic` | Runtime data validation for LLM output |
+| `guardrails-ai` | Input / tool-call / output safety guardrails framework |
 | `openai` *(optional)* | Azure OpenAI provider |
 
 ---

@@ -4,3 +4,4 @@ pydantic
 rich
 openai
 requests
+guardrails-ai>=0.5.0
