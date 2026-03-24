@@ -364,6 +364,79 @@ Recommended controls:
 - Add outbound host allowlist in enterprise deployments.
 - Store ADO PAT in secure secret store (not plain .env on shared hosts).
 
+### 13.1 Security Audit Findings (March 2026)
+
+This section captures a focused application-security audit for a multi-user shipping scenario.
+
+| ID | Severity | Finding | Evidence Location | Risk |
+|---|---|---|---|---|
+| SA-01 | High | Tool output is not independently sanitized before being appended as `role=tool` | `agent/orchestrator.py` tool-result append path | Indirect prompt injection via external data can steer downstream model decisions |
+| SA-02 | High | Error details can be propagated to user-visible/model-visible channels | `agent/orchestrator.py` turn/tool error handling paths | Information leakage of internals, making exploitation and reconnaissance easier |
+| SA-03 | Medium-High | Guardrails validator availability is not fail-closed | `agent/guardrails.py` optional import + fallback behavior | Security checks can silently weaken due to deployment drift |
+| SA-04 | Medium | ADO WIQL tool executes arbitrary queries | `mcp_server/ado_tools_server.py` `list_work_items(wiql)` | Data overreach/exfiltration through unrestricted query patterns |
+| SA-05 | Medium | Tool policy defaults to allow-all when no allowlist is provided | `agent/guardrails.py` allowlist logic | Future sensitive tools may become reachable without explicit approval |
+| SA-06 | Low-Medium | ADO fetch returns broader-than-needed fields (`$expand=all`) | `mcp_server/ado_tools_server.py` `get_work_item()` | Enlarged data exposure and prompt-context leakage surface |
+
+### 13.2 Threat Scenarios
+
+1. Indirect Injection via Enterprise Data
+- Adversary embeds instructions in work-item description/comments.
+- Tool returns content to host; host re-injects text into LLM context.
+- Model follows malicious instructions despite clean user input.
+
+2. Reconnaissance via Error Surface
+- Malformed calls trigger exceptions containing internal details.
+- Error text is reflected to user/model.
+- Attacker iterates on discovered internals (tool names, infrastructure hints).
+
+3. Query Abuse / Data Overreach
+- Model or user crafts broad WIQL to enumerate items.
+- System returns more data than task requires.
+- Sensitive metadata appears in prompt and/or final output.
+
+### 13.3 Required Remediation Plan (Pre-Release)
+
+1. Add tool-result guardrail stage
+- Introduce `check_tool_result(text)` in `Guardrails`.
+- Apply before appending `role=tool` messages.
+- Include injection, secret-pattern, and length controls.
+
+2. Implement fail-closed security mode
+- Add `SECURITY_MODE=prod`.
+- In prod mode, fail startup if required validators are absent.
+- Require explicit `ALLOWED_TOOLS` in prod mode.
+
+3. Sanitize error handling contract
+- Replace user-visible raw exception messages with generic errors.
+- Keep full diagnostics in structured internal logs only.
+
+4. Constrain ADO query capability
+- Replace free-form WIQL with approved templates or guarded parser checks.
+- Enforce upper limits (result count, field scope, temporal bounds).
+
+5. Minimize returned data by default
+- Avoid `$expand=all` unless specifically required.
+- Return field subsets aligned to least-privilege data exposure.
+
+### 13.4 Verification Criteria (Security Acceptance)
+
+The release is security-ready only when all checks below pass:
+
+- `SECURITY_MODE=prod` startup validation test passes.
+- Missing validator test fails startup as expected.
+- Tool-result injection test demonstrates blocking/redaction.
+- Error leakage test confirms no raw internal exception text reaches users.
+- WIQL abuse tests confirm rejection of non-compliant queries.
+- Logging tests confirm no PAT/secret-like values are emitted.
+
+### 13.5 Residual Risk Note
+
+Even after controls above, LLM-based systems retain residual model risk (hallucination, policy bypass attempts). Operational mitigations should include:
+- audit logging,
+- monitored abuse detection,
+- periodic prompt/policy red-team tests,
+- and staged rollout with kill-switch capability.
+
 ## 14. Observability and Telemetry
 
 Current:

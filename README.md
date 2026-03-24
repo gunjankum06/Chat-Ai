@@ -206,6 +206,43 @@ guardrails hub install hub://guardrails/toxic_language   # optional
 
 ---
 
+## Security Audit (March 2026)
+
+This project was reviewed with a production mindset for shipping to multiple users. Findings below are ranked by severity and mapped to practical remediation.
+
+### Findings Summary
+
+| Severity | Finding | Impact | Affected Component |
+|---|---|---|---|
+| High | Tool output is re-injected into LLM without dedicated sanitization | Indirect prompt injection from external systems (e.g., ADO fields/comments) can influence model behavior | `agent/orchestrator.py` |
+| High | Raw exception details are surfaced to users/model in some paths | Internal implementation details may leak and assist adversarial probing | `agent/orchestrator.py` |
+| Medium-High | Guardrails may silently degrade when hub validators are missing | Security posture weakens at runtime without hard startup failure | `agent/guardrails.py` |
+| Medium | Arbitrary WIQL execution in ADO tool | Broad data exfiltration/query abuse risk | `mcp_server/ado_tools_server.py` |
+| Medium | Tool allowlist defaults to permissive behavior when unset | Newly added sensitive tools can become callable unintentionally | `agent/guardrails.py` |
+| Low-Medium | Data minimization gap (`$expand=all`, rich fields) | Unnecessary sensitive data flows into prompt context | `mcp_server/ado_tools_server.py` |
+
+### Production Hardening Actions
+
+1. Add `check_tool_result()` guardrail before appending MCP output to conversation history.
+2. Replace user-facing raw exception text with generic safe error messages; keep details in internal logs only.
+3. Add strict mode (`SECURITY_MODE=prod`) that fails startup if required guardrail validators are unavailable.
+4. Require explicit `ALLOWED_TOOLS` in production mode and fail startup if empty.
+5. Restrict WIQL input with server-side policy checks (query templates/allowlist constraints).
+6. Reduce ADO response surface (avoid `$expand=all`; return only required fields).
+7. Add structured audit logs for guardrail blocks, tool calls, and policy denials.
+
+### Release Gate (Recommended)
+
+Before shipping to users, require all checks below to pass:
+
+- Guardrails strict mode enabled and validated in startup checks.
+- Tool-output sanitization path covered by automated tests.
+- No raw exception text returned to end users.
+- ADO tool queries constrained and regression-tested for abuse cases.
+- Per-turn logging does not include PATs/secrets/PII.
+
+---
+
 ## LLM Providers
 
 ### MockLLM (`LLM_PROVIDER=mock`)
