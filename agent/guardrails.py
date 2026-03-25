@@ -20,6 +20,7 @@ Environment variables:
 
 import logging
 import os
+import re
 from typing import Any, Dict, Optional
 
 from guardrails import Guard
@@ -70,9 +71,13 @@ class Guardrails:
     """
 
     def __init__(self) -> None:
+        self.security_mode = (os.getenv("SECURITY_MODE") or "dev").strip().lower()
+        self.strict_mode = self.security_mode in ("prod", "production", "strict")
+
         self.max_input_length: int = int(os.getenv("MAX_INPUT_LENGTH", "2000"))
         self.max_output_length: int = int(os.getenv("MAX_OUTPUT_LENGTH", "8000"))
         self.max_arg_length: int = int(os.getenv("MAX_ARG_LENGTH", "1000"))
+        self.max_tool_result_length: int = int(os.getenv("MAX_TOOL_RESULT_LENGTH", "6000"))
 
         raw_allowed = os.getenv("ALLOWED_TOOLS", "").strip()
         self.allowed_tools: Optional[set] = (
@@ -81,9 +86,41 @@ class Guardrails:
             else None  # None means "all tools permitted"
         )
 
+        # In strict mode, fail closed on missing critical validators.
+        missing_validators = []
+        if not _HAS_VALID_LENGTH:
+            missing_validators.append("ValidLength")
+        if not _HAS_PROMPT_INJECTION:
+            missing_validators.append("DetectPromptInjection")
+
+        if self.strict_mode and missing_validators:
+            raise RuntimeError(
+                "SECURITY_MODE is strict but required guardrails validators are missing: "
+                f"{', '.join(missing_validators)}"
+            )
+
+        if self.strict_mode and self.allowed_tools is None:
+            raise RuntimeError(
+                "SECURITY_MODE is strict but ALLOWED_TOOLS is not configured. "
+                "Set ALLOWED_TOOLS to a comma-separated explicit allowlist."
+            )
+
         self._input_guard = self._build_input_guard()
         self._output_guard = self._build_output_guard()
         self._arg_guard = self._build_arg_guard()
+
+        # Simple fallback patterns for tool-result sanitization.
+        self._tool_injection_patterns = [
+            re.compile(r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions?", re.IGNORECASE),
+            re.compile(r"override\s+(your|all)\s+(instructions?|system|directives?)", re.IGNORECASE),
+            re.compile(r"<\s*/?system\s*>", re.IGNORECASE),
+            re.compile(r"do not follow.*policy", re.IGNORECASE),
+        ]
+        self._secret_patterns = [
+            re.compile(r"(?i)\b(authorization|api[_-]?key|token|pat|password|secret)\b\s*[:=]\s*[^\s,;]+"),
+            re.compile(r"(?i)\bbearer\s+[a-z0-9\-\._~\+/]+=*"),
+            re.compile(r"(?i)\bghp_[a-z0-9]{20,}\b"),
+        ]
 
     # ------------------------------------------------------------------
     # Guard builders
@@ -194,3 +231,33 @@ class Guardrails:
         except Exception as exc:
             logger.warning("Output validation error: %s", exc)
             return text
+
+    # ------------------------------------------------------------------
+    # 4. Tool-result guardrail
+    # ------------------------------------------------------------------
+    def check_tool_result(self, text: str) -> str:
+        """
+        Validate and sanitize tool output before it is appended to model context.
+        """
+        sanitized = text
+
+        if len(sanitized) > self.max_tool_result_length:
+            logger.warning(
+                "Tool result truncated: %d -> %d chars",
+                len(sanitized),
+                self.max_tool_result_length,
+            )
+            sanitized = sanitized[: self.max_tool_result_length] + "\n[tool result truncated]"
+
+        for pattern in self._secret_patterns:
+            sanitized = pattern.sub("[redacted-secret]", sanitized)
+
+        injection_hits = [p for p in self._tool_injection_patterns if p.search(sanitized)]
+        if injection_hits:
+            if self.strict_mode:
+                raise GuardrailViolation("Tool result blocked: potential indirect prompt injection detected.")
+            logger.warning("Tool result had prompt-injection indicators; redacting suspicious content")
+            for pattern in self._tool_injection_patterns:
+                sanitized = pattern.sub("[redacted-injection-pattern]", sanitized)
+
+        return sanitized

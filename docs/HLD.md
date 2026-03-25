@@ -114,6 +114,7 @@ Turn lifecycle implemented by AgentOrchestrator:
 Safety boundaries are explicit and deterministic:
 - Input boundary: before history mutation.
 - Tool boundary: before side-effecting tool execution.
+- Tool-result boundary: before external tool output is re-injected into LLM context.
 - Output boundary: before user-visible response.
 
 ## 6. Sequence Flows
@@ -142,7 +143,8 @@ Orchestrator -> Contract layer: parse+validate JSON
 Orchestrator -> Guardrails: check_tool_call(name,args)
 Orchestrator -> MCP: call_tool(name,args)
 MCP -> Orchestrator: tool result blocks
-Orchestrator: normalize tool text and append role=tool
+Orchestrator -> Guardrails: check_tool_result(tool_text)
+Orchestrator: append sanitized role=tool message
 Orchestrator -> LLM: complete(messages)
 LLM -> Orchestrator: {"type":"final","content":"..."}
 Orchestrator -> Guardrails: check_output
@@ -218,6 +220,7 @@ Core API:
 class Guardrails:
     def check_input(self, text: str) -> str: ...
     def check_tool_call(self, name: str, arguments: Dict[str, Any]) -> None: ...
+  def check_tool_result(self, text: str) -> str: ...
     def check_output(self, text: str) -> str: ...
 ```
 
@@ -227,6 +230,11 @@ Framework primitives:
   - ValidLength
   - DetectPromptInjection
   - ToxicLanguage (optional)
+
+Strict mode behavior:
+- `SECURITY_MODE=prod|strict` enables fail-closed startup checks.
+- Required validators: `ValidLength`, `DetectPromptInjection`.
+- `ALLOWED_TOOLS` must be explicitly configured in strict mode.
 
 Degradation strategy:
 - Missing hub validator does not crash startup.
@@ -238,13 +246,18 @@ Degradation strategy:
 |---|---|---|
 | MAX_INPUT_LENGTH | max user input length | 2000 |
 | MAX_ARG_LENGTH | max individual tool argument length | 1000 |
+| MAX_TOOL_RESULT_LENGTH | max tool output re-injected into LLM context | 6000 |
 | MAX_OUTPUT_LENGTH | max final output length | 8000 |
+| SECURITY_MODE | `dev` or fail-closed `prod`/`strict` | dev |
 | ALLOWED_TOOLS | optional allowlist of tool names | empty |
 
 ### 8.4 Failure Semantics
 
 - Input violation: turn blocked before mutation of message history.
 - Tool-call violation: tool not executed; role=tool error message appended; loop continues.
+- Tool-result violation:
+  - strict mode: block re-injection and append policy error payload.
+  - dev mode: redact suspicious patterns and continue.
 - Output violation:
   - If fix-mode applies (ValidLength): truncate output.
   - Else raise violation and surface safe error.
@@ -363,6 +376,12 @@ Recommended controls:
 - Redact PII/secrets before logging tool payloads.
 - Add outbound host allowlist in enterprise deployments.
 - Store ADO PAT in secure secret store (not plain .env on shared hosts).
+
+Implemented in current codebase:
+- Safe error contract for user-visible failures (generic response text).
+- Tool-result sanitization/redaction prior to model re-prompt.
+- Strict production mode startup checks for validator presence and allowlist policy.
+- ADO query policy controls (length, token restrictions, project scoping, bounded result volume).
 
 ### 13.1 Security Audit Findings (March 2026)
 
@@ -513,7 +532,9 @@ Optimization levers:
 | MAX_HISTORY_MESSAGES | 20 | rolling non-system history size |
 | MAX_INPUT_LENGTH | 2000 | input guard limit |
 | MAX_ARG_LENGTH | 1000 | tool arg guard limit |
+| MAX_TOOL_RESULT_LENGTH | 6000 | tool result re-injection guard limit |
 | MAX_OUTPUT_LENGTH | 8000 | output guard limit |
+| SECURITY_MODE | dev | `dev` or strict fail-closed `prod`/`strict` |
 | ALLOWED_TOOLS | empty | optional comma-separated allowlist |
 | LOG_LEVEL | INFO | runtime log level |
 | AZURE_OPENAI_ENDPOINT | - | Azure endpoint |
@@ -523,6 +544,11 @@ Optimization levers:
 | ADO_ORG | - | Azure DevOps org |
 | ADO_PROJECT | - | Azure DevOps project |
 | ADO_PAT | - | Azure DevOps PAT |
+| ADO_MAX_WIQL_LENGTH | 1000 | max accepted WIQL length |
+| ADO_MAX_RESULTS | 100 | max WIQL result size (capped 200) |
+| ADO_MAX_COMMENTS | 50 | max returned comments |
+| ADO_MAX_COMMENT_LENGTH | 2000 | max comment text length |
+| ADO_INCLUDE_DESCRIPTION | false | include description field when true |
 
 ## 18. Engineering Extension Patterns
 

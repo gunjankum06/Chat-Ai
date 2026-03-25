@@ -16,9 +16,9 @@ Log to stderr only.
 """
 
 import base64
-import json
 import logging
 import os
+import re
 import sys
 
 import requests
@@ -49,6 +49,33 @@ def _headers() -> dict:
     }
 
 
+def _validate_wiql(wiql: str) -> str:
+    """
+    Basic server-side WIQL policy checks to reduce data-overreach and abuse.
+    """
+    query = (wiql or "").strip()
+    max_len = int(os.getenv("ADO_MAX_WIQL_LENGTH", "1000"))
+    if not query:
+        raise ValueError("WIQL query cannot be empty.")
+    if len(query) > max_len:
+        raise ValueError(f"WIQL query exceeds max length of {max_len} characters.")
+
+    lowered = query.lower()
+    if "from workitems" not in lowered or "select" not in lowered:
+        raise ValueError("Only SELECT ... FROM WorkItems queries are allowed.")
+
+    # Disallow obvious unsafe/broadening patterns.
+    forbidden = [";", "drop ", "delete ", "update ", "insert ", "exec ", "union "]
+    if any(token in lowered for token in forbidden):
+        raise ValueError("WIQL query contains forbidden tokens.")
+
+    # Keep queries project-scoped.
+    if "@project" not in lowered and "system.teamproject" not in lowered:
+        raise ValueError("WIQL must be scoped to project (use @project or System.TeamProject).")
+
+    return query
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -59,7 +86,24 @@ def get_work_item(id: int) -> dict:
     Fetch a single work item (bug / task / user story) by its numeric ID
     from Azure DevOps and return the most useful fields.
     """
-    url  = f"{_base_url()}/wit/workitems/{id}?api-version=7.1&$expand=all"
+    fields = [
+        "System.Id",
+        "System.WorkItemType",
+        "System.Title",
+        "System.State",
+        "System.AssignedTo",
+        "Microsoft.VSTS.Common.Priority",
+        "Microsoft.VSTS.Common.Severity",
+        "System.AreaPath",
+        "System.IterationPath",
+        "System.CreatedDate",
+        "System.ChangedDate",
+        "System.Tags",
+    ]
+    if (os.getenv("ADO_INCLUDE_DESCRIPTION") or "false").strip().lower() == "true":
+        fields.append("System.Description")
+
+    url  = f"{_base_url()}/wit/workitems/{id}?api-version=7.1&fields={','.join(fields)}"
     resp = requests.get(url, headers=_headers(), timeout=15)
     resp.raise_for_status()
 
@@ -96,9 +140,11 @@ def list_work_items(wiql: str) -> list:
           AND [System.State] = 'Active'
         ORDER BY [System.ChangedDate] DESC
     """
+    safe_wiql = _validate_wiql(wiql)
+
     query_url = f"{_base_url()}/wit/wiql?api-version=7.1"
     resp = requests.post(query_url, headers=_headers(),
-                         json={"query": wiql}, timeout=15)
+                         json={"query": safe_wiql}, timeout=15)
     resp.raise_for_status()
 
     items = resp.json().get("workItems", [])
@@ -106,7 +152,8 @@ def list_work_items(wiql: str) -> list:
         return []
 
     # Batch-fetch titles/states for the returned IDs (max 200 per API call)
-    ids = [str(i["id"]) for i in items[:200]]
+    max_results = min(int(os.getenv("ADO_MAX_RESULTS", "100")), 200)
+    ids = [str(i["id"]) for i in items[:max_results]]
     batch_url = (
         f"https://dev.azure.com/{os.environ['ADO_ORG']}"
         f"/_apis/wit/workitems?ids={','.join(ids)}"
@@ -138,13 +185,19 @@ def get_work_item_comments(id: int) -> list:
     resp = requests.get(url, headers=_headers(), timeout=15)
     resp.raise_for_status()
 
+    max_comments = int(os.getenv("ADO_MAX_COMMENTS", "50"))
+    max_comment_len = int(os.getenv("ADO_MAX_COMMENT_LENGTH", "2000"))
+
     comments = []
-    for c in resp.json().get("comments", []):
+    for c in resp.json().get("comments", [])[:max_comments]:
         author = c.get("createdBy") or {}
+        text = c.get("text")
+        if isinstance(text, str) and len(text) > max_comment_len:
+            text = text[:max_comment_len] + "\n[comment truncated]"
         comments.append({
             "author": author.get("displayName") if isinstance(author, dict) else author,
             "date":   c.get("createdDate"),
-            "text":   c.get("text"),
+            "text":   text,
         })
     return comments
 

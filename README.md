@@ -165,14 +165,21 @@ All configuration is via `.env` (or real environment variables). Copy `.env.exam
 | `MAX_INPUT_LENGTH` | `2000` | Max characters accepted from the user (guardrails-ai) |
 | `MAX_OUTPUT_LENGTH` | `8000` | Max characters in the assistant reply (guardrails-ai) |
 | `MAX_ARG_LENGTH` | `1000` | Max characters per tool argument value (guardrails-ai) |
+| `MAX_TOOL_RESULT_LENGTH` | `6000` | Max characters from MCP tool output re-injected into LLM context |
+| `SECURITY_MODE` | `dev` | `dev` (best effort) or `prod`/`strict` (fail-closed startup checks) |
 | `ALLOWED_TOOLS` | *(empty — all allowed)* | Comma-separated allowlist of permitted MCP tool names |
 | `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `ADO_MAX_WIQL_LENGTH` | `1000` | Max WIQL query length accepted by ADO MCP server |
+| `ADO_MAX_RESULTS` | `100` | Max work items returned from WIQL batch query (capped at 200) |
+| `ADO_MAX_COMMENTS` | `50` | Max comments returned by `get_work_item_comments` |
+| `ADO_MAX_COMMENT_LENGTH` | `2000` | Max length per returned comment text |
+| `ADO_INCLUDE_DESCRIPTION` | `false` | Include work-item description field when true |
 
 ---
 
 ## Guardrails (guardrails-ai)
 
-The project uses the **[guardrails-ai](https://github.com/guardrails-ai/guardrails)** framework (`pip install guardrails-ai`) to enforce safety and quality policies at three points in every agent turn.
+The project uses the **[guardrails-ai](https://github.com/guardrails-ai/guardrails)** framework (`pip install guardrails-ai`) to enforce safety and quality policies at four points in every agent turn.
 
 ### Enforcement Points
 
@@ -180,6 +187,7 @@ The project uses the **[guardrails-ai](https://github.com/guardrails-ai/guardrai
 |---|---|---|
 | **Input** | Before user message enters LLM context | `ValidLength`, `DetectPromptInjection` |
 | **Tool call** | Before MCP tool is executed | `ALLOWED_TOOLS` allowlist, `ValidLength` per argument |
+| **Tool result** | Before tool output is appended back into model context | Truncation, secret redaction, indirect-injection detection |
 | **Output** | Before final answer is returned to user | `ValidLength` (auto-fix truncation), `ToxicLanguage` |
 
 ### Hub Validators
@@ -192,7 +200,7 @@ guardrails hub install hub://guardrails/detect_prompt_injection
 guardrails hub install hub://guardrails/toxic_language   # optional
 ```
 
-> **Graceful degradation** — if a hub validator is not installed, `agent/guardrails.py` logs a warning and falls back to simple built-in checks so the agent continues to work.
+> **Strict production mode** — set `SECURITY_MODE=prod` to fail startup if required validators are missing and to require an explicit `ALLOWED_TOOLS` list.
 
 ### Violation Behaviour
 
@@ -201,6 +209,8 @@ guardrails hub install hub://guardrails/toxic_language   # optional
 | Input too long or injection detected | Turn blocked; user sees a `Blocked:` message |
 | Tool not on `ALLOWED_TOOLS` list | Tool call skipped; LLM receives an error payload and may retry |
 | Tool argument too long | Same as above |
+| Tool result contains secrets | Secret-like tokens are redacted before re-injection |
+| Tool result appears injection-like | In `dev`: redacted; in `prod`: blocked |
 | Output too long | Auto-truncated with a `[... response truncated]` notice |
 | Toxic output | Turn raises `GuardrailViolation`, user sees friendly error |
 
@@ -208,7 +218,15 @@ guardrails hub install hub://guardrails/toxic_language   # optional
 
 ## Security Audit (March 2026)
 
-This project was reviewed with a production mindset for shipping to multiple users. Findings below are ranked by severity and mapped to practical remediation.
+This project was reviewed with a production mindset for shipping to multiple users. Findings were ranked by severity and the critical controls below have been implemented.
+
+### Implemented Hardening Controls
+
+1. Added tool-result sanitization guard (`check_tool_result`) before output is re-injected into LLM context.
+2. Added strict fail-closed production mode (`SECURITY_MODE=prod`) for validator and tool allowlist enforcement.
+3. Replaced raw user-facing exception details with generic safe errors.
+4. Added ADO WIQL policy validation and query-size/result-size limits.
+5. Reduced default ADO data exposure by removing broad expansion and making description opt-in.
 
 ### Findings Summary
 

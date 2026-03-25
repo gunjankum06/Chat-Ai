@@ -101,10 +101,13 @@ class AgentOrchestrator:
                         final_text = await self._run_agent_loop(session=session, messages=messages)
                     except Exception as exc:
                         logger.exception("Agent loop failed")
-                        final_text = f"Sorry, something went wrong: {exc}"
+                        final_text = "Sorry, something went wrong while processing your request."
 
                     # --- output guardrail ---
-                    final_text = self.guardrails.check_output(final_text)
+                    try:
+                        final_text = self.guardrails.check_output(final_text)
+                    except GuardrailViolation:
+                        final_text = "Sorry, I could not return a safe response for that request."
 
                     console.print(f"\n[bold green]Assistant>[/bold green] {final_text}")
                     messages.append({"role": "assistant", "content": final_text})
@@ -144,7 +147,7 @@ class AgentOrchestrator:
                 messages.append({
                     "role": "tool",
                     "name": tool_name,
-                    "content": json.dumps({"error": f"Tool call blocked: {exc}"}, ensure_ascii=False),
+                    "content": json.dumps({"error": "Tool call blocked by policy."}, ensure_ascii=False),
                 })
                 continue
 
@@ -156,7 +159,7 @@ class AgentOrchestrator:
                 messages.append({
                     "role": "tool",
                     "name": tool_name,
-                    "content": json.dumps({"error": str(exc)}, ensure_ascii=False)
+                    "content": json.dumps({"error": "Tool execution failed."}, ensure_ascii=False)
                 })
                 continue
 
@@ -169,6 +172,18 @@ class AgentOrchestrator:
             tool_text = "\n".join(text_parts) if text_parts else json.dumps(
                 tool_result.model_dump(mode="json"), ensure_ascii=False
             )
+
+            try:
+                tool_text = self.guardrails.check_tool_result(tool_text)
+            except GuardrailViolation as exc:
+                logger.warning("Tool result blocked by guardrail: %s", exc)
+                messages.append({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"error": "Tool result blocked by policy."}, ensure_ascii=False),
+                })
+                continue
+
             messages.append({
                 "role": "tool",
                 "name": tool_name,
