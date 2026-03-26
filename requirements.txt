@@ -1,7 +1,12 @@
+# Core
 mcp
 python-dotenv
 pydantic
 rich
-openai
+
+# LLM providers — install the SDK for whichever provider(s) you use
+openai        # required for: azure_openai, openai, ollama (OpenAI-compatible)
+# anthropic   # required for: anthropic  (pip install anthropic)
+
 requests
 guardrails-ai>=0.5.0

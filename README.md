@@ -8,7 +8,7 @@ CLI → LLM → (tool call?) → MCP Server → LLM → CLI
 
 The LLM is asked to decide on every turn whether to call a tool or answer directly. It responds in a strict JSON schema (`tool_call` or `final`). The orchestrator interprets the decision, calls the MCP server when needed, and feeds the result back into the conversation until a final answer is produced.
 
-Every message passing through the pipeline is protected by **[guardrails-ai](https://github.com/guardrails-ai/guardrails)** at three enforcement points — user input, tool-call arguments, and final output — using hub validators for length limits, prompt-injection detection, and toxic-language filtering.
+Every message passing through the pipeline is protected by **[guardrails-ai](https://github.com/guardrails-ai/guardrails)** at **four** enforcement points — user input, tool-call arguments, tool results, and final output — using hub validators for length limits, prompt-injection detection, and toxic-language filtering.
 
 ---
 
@@ -54,7 +54,10 @@ Every message passing through the pipeline is protected by **[guardrails-ai](htt
 │     - ALLOWED_TOOLS allowlist                                   │
 │     - ValidLength per argument (max MAX_ARG_LENGTH chars)       │
 │                                                                 │
-│  ③ check_output()     ← before answer is returned to user      │
+│  ③ check_tool_result() ← before tool output re-enters context  │
+│     - Truncation, secret redaction, injection detection         │
+│                                                                 │
+│  ④ check_output()     ← before answer is returned to user      │
 │     - ValidLength / auto-fix truncation (MAX_OUTPUT_LENGTH)     │
 │     - ToxicLanguage   (optional)                                │
 └─────────────────────────────────────────────────────────────────┘
@@ -74,14 +77,19 @@ Chat-Ai/
 │   ├── orchestrator.py          # Core agent loop (CLI ↔ LLM ↔ MCP)
 │   ├── guardrails.py            # guardrails-ai Guard wrappers (input / tool / output)
 │   ├── prompts.py               # System prompt + tool-text formatter
-│   ├── protocol.py              # Pydantic models: ToolCall, FinalAnswer, LLMDecision
+│   ├── protocol.py              # Pydantic models: LLMDecision schema
 │   └── util.py                  # JSON parsing + LLMDecision validation helpers
 ├── llm/
 │   ├── base.py                  # Abstract LLMClient base class
+│   ├── factory.py               # Provider registry and create_llm() factory
 │   ├── mock_llm.py              # Deterministic mock (no API key required)
-│   └── azure_openai_llm.py      # Azure OpenAI provider (optional)
+│   ├── azure_openai_llm.py      # Azure OpenAI provider
+│   ├── openai_llm.py            # Standard OpenAI provider
+│   ├── anthropic_llm.py         # Anthropic Claude provider
+│   └── ollama_llm.py            # Ollama local model provider
 └── mcp_server/
-    ├── mock_tools_server.py     # FastMCP server exposing demo tools
+    ├── mock_tools_server.py     # FastMCP server: greet, get_defect_details
+    ├── ado_tools_server.py      # FastMCP Azure DevOps server
     └── README.md
 ```
 
@@ -89,11 +97,14 @@ Chat-Ai/
 
 ## Prerequisites
 
-| Requirement | Version |
+| Requirement | Version / Notes |
 |---|---|
 | Python | 3.10 + |
 | pip | latest |
 | Azure OpenAI resource | only if `LLM_PROVIDER=azure_openai` |
+| OpenAI API key | only if `LLM_PROVIDER=openai` |
+| Anthropic API key | only if `LLM_PROVIDER=anthropic` (`pip install anthropic`) |
+| [Ollama](https://ollama.com) | only if `LLM_PROVIDER=ollama` (local, no API key needed) |
 
 ---
 
@@ -153,22 +164,67 @@ You> exit
 
 All configuration is via `.env` (or real environment variables). Copy `.env.example` to `.env` and edit:
 
+### Core
+
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `mock` | LLM backend to use. Allowed: `mock`, `azure_openai` |
-| `AZURE_OPENAI_ENDPOINT` | — | Azure OpenAI resource endpoint URL |
-| `AZURE_OPENAI_API_KEY` | — | Azure OpenAI API key |
-| `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | API version string |
-| `AZURE_OPENAI_DEPLOYMENT` | — | Deployment/model name (e.g. `gpt-4.1-mini`) |
+| `LLM_PROVIDER` | `mock` | LLM backend: `mock`, `azure_openai`, `openai`, `anthropic`, `ollama` |
 | `MAX_TOOL_STEPS` | `5` | Max tool-call iterations per user turn (safety guard) |
 | `MAX_HISTORY_MESSAGES` | `20` | Rolling window of non-system messages kept in context |
-| `MAX_INPUT_LENGTH` | `2000` | Max characters accepted from the user (guardrails-ai) |
-| `MAX_OUTPUT_LENGTH` | `8000` | Max characters in the assistant reply (guardrails-ai) |
-| `MAX_ARG_LENGTH` | `1000` | Max characters per tool argument value (guardrails-ai) |
+| `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+### Guardrails
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_INPUT_LENGTH` | `2000` | Max characters accepted from the user |
+| `MAX_OUTPUT_LENGTH` | `8000` | Max characters in the assistant reply |
+| `MAX_ARG_LENGTH` | `1000` | Max characters per tool argument value |
 | `MAX_TOOL_RESULT_LENGTH` | `6000` | Max characters from MCP tool output re-injected into LLM context |
 | `SECURITY_MODE` | `dev` | `dev` (best effort) or `prod`/`strict` (fail-closed startup checks) |
 | `ALLOWED_TOOLS` | *(empty — all allowed)* | Comma-separated allowlist of permitted MCP tool names |
-| `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+### Azure OpenAI (`LLM_PROVIDER=azure_openai`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `AZURE_OPENAI_ENDPOINT` | — | Azure OpenAI resource endpoint URL |
+| `AZURE_OPENAI_API_KEY` | — | Azure OpenAI API key |
+| `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | API version string |
+| `AZURE_OPENAI_DEPLOYMENT` | — | Deployment/model name (e.g. `gpt-4o`) |
+
+### OpenAI (`LLM_PROVIDER=openai`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | — | API key from [platform.openai.com](https://platform.openai.com) |
+| `OPENAI_MODEL` | `gpt-4o` | Model name |
+
+### Anthropic (`LLM_PROVIDER=anthropic`)
+
+Requires `pip install anthropic`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | API key from [console.anthropic.com](https://console.anthropic.com) |
+| `ANTHROPIC_MODEL` | `claude-opus-4-5` | Model ID |
+
+### Ollama — local models (`LLM_PROVIDER=ollama`)
+
+Install [Ollama](https://ollama.com), pull a model (`ollama pull llama3`), then:
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama server URL |
+| `OLLAMA_MODEL` | `llama3` | Local model name |
+
+### Azure DevOps MCP Server
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADO_ORG` | — | Azure DevOps organisation slug |
+| `ADO_PROJECT` | — | Project name |
+| `ADO_PAT` | — | Personal Access Token (Work Items read scope) |
 | `ADO_MAX_WIQL_LENGTH` | `1000` | Max WIQL query length accepted by ADO MCP server |
 | `ADO_MAX_RESULTS` | `100` | Max work items returned from WIQL batch query (capped at 200) |
 | `ADO_MAX_COMMENTS` | `50` | Max comments returned by `get_work_item_comments` |
@@ -263,26 +319,75 @@ Before shipping to users, require all checks below to pass:
 
 ## LLM Providers
 
-### MockLLM (`LLM_PROVIDER=mock`)
+### `mock` (default)
 
-Deterministic, no network calls, no API key. Useful for local development and CI.
+Deterministic, no network calls, no API key. Ideal for local development and CI.
 
-Recognized patterns:
+```bash
+python main.py --server python mcp_server/mock_tools_server.py
+```
+
+Recognised patterns:
 - `greet <name>` → calls the `greet` MCP tool
-- `defect <id>` → calls the `get_defect_details` MCP tool
+- `defect <id>` or `get defect <id>` → calls `get_defect_details`
 - anything else → returns a help message as `final`
 
-### AzureOpenAILLM (`LLM_PROVIDER=azure_openai`)
+### `azure_openai`
 
-Requires `pip install openai` and valid Azure OpenAI credentials in `.env`.  
-The LLM is instructed via `SYSTEM_PROMPT` to respond only in the strict JSON schema:
+Azure-hosted OpenAI models via the Azure OpenAI Service.
+
+```bash
+# .env
+LLM_PROVIDER=azure_openai
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_API_KEY=your-key
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+```
+
+### `openai`
+
+Standard OpenAI API (api.openai.com).
+
+```bash
+# .env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o      # optional, default: gpt-4o
+```
+
+### `anthropic`
+
+Anthropic Claude models. Requires `pip install anthropic`.
+
+```bash
+# .env
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-opus-4-5   # optional
+```
+
+### `ollama` (local / air-gapped)
+
+Any local model served by [Ollama](https://ollama.com) via its OpenAI-compatible endpoint. No API key or internet required after initial model download.
+
+```bash
+# 1. Install Ollama and pull a model
+ollama pull llama3
+
+# 2. .env
+LLM_PROVIDER=ollama
+OLLAMA_MODEL=llama3             # optional, default: llama3
+# OLLAMA_BASE_URL defaults to http://localhost:11434/v1
+```
+
+All providers speak the same `LLMClient.complete()` interface defined in `llm/base.py`. The LLM is instructed via `SYSTEM_PROMPT` to respond only in the strict JSON schema:
 
 ```json
 // Tool call
 {"type": "tool_call", "name": "<tool_name>", "arguments": {...}}
 
 // Final answer
-{"type": "final", "content": "<answer>"}
+{"type": "final", "content": "<answer>"}  
 ```
 
 ---
@@ -293,9 +398,9 @@ The LLM is instructed via `SYSTEM_PROMPT` to respond only in the strict JSON sch
 
 | Method | Description |
 |---|---|
-| `__init__(server_command)` | Selects LLM provider from env; instantiates `Guardrails`; stores MCP server command |
+| `__init__(server_command)` | Calls `create_llm(LLM_PROVIDER)` from `llm/factory.py`; instantiates `Guardrails`; stores MCP server command |
 | `run_cli()` | Spawns MCP subprocess, discovers tools, starts interactive loop; applies input + output guardrails |
-| `_run_agent_loop(session, messages)` | Iterates LLM ↔ tool calls until `type=final` or step limit; applies tool-call guardrail |
+| `_run_agent_loop(session, messages)` | Iterates LLM ↔ tool calls until `type=final` or step limit; applies tool-call and tool-result guardrails |
 
 ### `agent/guardrails.py` — `Guardrails`
 
@@ -305,6 +410,7 @@ Wrapper around the **guardrails-ai** `Guard` API. Builds one `Guard` per enforce
 |---|---|---|
 | `check_input(text)` | `ValidLength`, `DetectPromptInjection` | Raises `GuardrailViolation` |
 | `check_tool_call(name, arguments)` | Allowlist + `ValidLength` per arg | Raises `GuardrailViolation` |
+| `check_tool_result(text)` | Truncation, redaction, injection detection | Returns sanitized text or raises `GuardrailViolation` |
 | `check_output(text)` | `ValidLength` (fix), `ToxicLanguage` | Truncates or raises `GuardrailViolation` |
 
 ### `agent/protocol.py`
@@ -333,6 +439,18 @@ Abstract base class. All providers must implement:
 async def complete(self, messages: List[Dict[str, Any]]) -> str: ...
 ```
 
+### `llm/factory.py` — provider registry
+
+Maps `LLM_PROVIDER` names to provider instances. Optional providers are registered only if their SDK is importable.
+
+| `LLM_PROVIDER` value | Provider class | SDK required |
+|---|---|---|
+| `mock` | `MockLLM` | none |
+| `azure_openai` | `AzureOpenAILLM` | `openai` |
+| `openai` | `OpenAILLM` | `openai` |
+| `anthropic` | `AnthropicLLM` | `anthropic` |
+| `ollama` | `OllamaLLM` | `openai` |
+
 ### `mcp_server/mock_tools_server.py`
 
 A [FastMCP](https://github.com/jlowin/fastmcp) stdio server with two demo tools:
@@ -348,7 +466,15 @@ A [FastMCP](https://github.com/jlowin/fastmcp) stdio server with two demo tools:
 
 **Add a new MCP tool:** Edit `mcp_server/mock_tools_server.py` and add a `@mcp.tool()` decorated function. No changes needed elsewhere — `list_tools()` discovers it automatically.
 
-**Add a new LLM provider:** Create a class in `llm/` that extends `LLMClient` and implement `complete()`. Then add a branch for it in `AgentOrchestrator.__init__()` keyed to a new `LLM_PROVIDER` value.
+**Add a new LLM provider:**
+1. Create `llm/my_provider_llm.py` implementing `LLMClient` (one method: `async complete(messages) -> str`).
+2. Add a `from_env()` static method that reads credentials from env vars.
+3. In `llm/factory.py`, add inside a `try/except ImportError` block:
+   ```python
+   from llm.my_provider_llm import MyProviderLLM
+   _register("my_provider", MyProviderLLM.from_env)
+   ```
+4. Set `LLM_PROVIDER=my_provider` in `.env`.
 
 **Point to a different MCP server:** Change the `--server` argument. Any MCP-compliant stdio server works.
 
@@ -360,10 +486,11 @@ A [FastMCP](https://github.com/jlowin/fastmcp) stdio server with two demo tools:
 |---|---|
 | `mcp` | MCP client + FastMCP server SDK |
 | `python-dotenv` | Load `.env` file into environment |
-| `rich` | Terminal formatting (panels, colored prompts) |
+| `rich` | Terminal formatting (panels, coloured prompts) |
 | `pydantic` | Runtime data validation for LLM output |
 | `guardrails-ai` | Input / tool-call / output safety guardrails framework |
-| `openai` *(optional)* | Azure OpenAI provider |
+| `openai` | Required for: `azure_openai`, `openai`, `ollama` providers |
+| `anthropic` *(optional)* | Required for: `anthropic` provider (`pip install anthropic`) |
 
 ---
 

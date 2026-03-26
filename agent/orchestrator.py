@@ -15,11 +15,7 @@ from agent.prompts import SYSTEM_PROMPT, tools_to_compact_text
 from agent.util import safe_parse_llm_json, validate_decision
 
 from llm.base import LLMClient
-from llm.mock_llm import MockLLM
-try:
-    from llm.azure_openai_llm import AzureOpenAILLM
-except Exception:
-    AzureOpenAILLM = None  # optional dependency
+from llm.factory import create_llm
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -37,13 +33,8 @@ class AgentOrchestrator:
 
         self.guardrails = Guardrails()
 
-        provider = (os.getenv("LLM_PROVIDER") or "mock").lower().strip()
-        if provider == "azure_openai":
-            if AzureOpenAILLM is None:
-                raise RuntimeError("AzureOpenAI selected but openai SDK not installed. pip install openai")
-            self.llm: LLMClient = AzureOpenAILLM.from_env()
-        else:
-            self.llm = MockLLM()
+        provider = os.getenv("LLM_PROVIDER", "mock")
+        self.llm: LLMClient = create_llm(provider)
 
     def _trim_history(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

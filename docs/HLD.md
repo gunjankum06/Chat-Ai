@@ -9,12 +9,23 @@ Audience:
 - Reviewers evaluating reliability/security trade-offs.
 - Operators running local and enterprise deployments.
 
-## 2. Scope and Non-Goals
+## 2. Changelog
+
+| Version | Date | Summary |
+|---|---|---|
+| 1.2.0 | 2026-03-26 | Generic LLM provider architecture: added `openai`, `anthropic`, `ollama` providers; introduced `llm/factory.py` registry; provider selection fully env-driven; removed hardcoded provider branches from orchestrator |
+| 1.1.0 | 2026-03-20 | Security hardening: tool-result guardrail, fail-closed prod mode, ADO WIQL policy controls, raw exception sanitization |
+| 1.0.0 | 2026-03-01 | Initial architecture: mock + Azure OpenAI providers, ADO MCP server, guardrails-ai integration |
+
+---
+
+## 3. Scope and Non-Goals
 
 In scope:
 - CLI-based single-session agent host.
 - MCP stdio tool-server integration.
-- Pluggable LLM providers (mock, Azure OpenAI).
+- Pluggable LLM providers (mock, Azure OpenAI, OpenAI, Anthropic, Ollama).
+- Provider registry with zero-configuration registration pattern.
 - Guardrails-ai policy enforcement on input/tool-call/output.
 - Deterministic orchestration with strict JSON decision schema.
 
@@ -24,47 +35,50 @@ Out of scope:
 - Browser UI.
 - Distributed execution scheduler.
 
-## 3. System Context
+## 4. System Context
 
 External systems:
 - Human user via terminal.
-- LLM provider (mock or Azure OpenAI).
+- LLM provider — one of: `mock` (local), `azure_openai`, `openai`, `anthropic`, `ollama` (local).
 - MCP server process (local child process over stdio).
-- Optional external APIs behind MCP tools (Azure DevOps).
+- Optional external APIs behind MCP tools (e.g. Azure DevOps, GitHub, Jira).
 
 System boundary:
-- Host process includes CLI, orchestrator, prompt/contract logic, guardrails, and LLM abstraction.
-- Tool integration logic is intentionally out-of-process in MCP servers.
+- Host process includes CLI, orchestrator, prompt/contract logic, guardrails, LLM factory, and provider implementations.
+- Tool integration logic is intentionally out-of-process in MCP servers, making the host provider- and backend-agnostic.
 
-## 4. Architecture Views
+## 5. Architecture Views
 
-### 4.1 Logical Components
+### 5.1 Logical Components
 
 1. Bootstrap Layer
-- File: main.py
+- File: `main.py`
 - Parses args, loads env, configures logging, starts orchestrator.
 
 2. Orchestration Layer
-- File: agent/orchestrator.py
+- File: `agent/orchestrator.py`
 - Owns lifecycle and turn execution state machine.
+- Delegates provider selection to the factory; has no hardcoded provider knowledge.
 
 3. Contract Layer
-- Files: agent/protocol.py, agent/util.py, agent/prompts.py
+- Files: `agent/protocol.py`, `agent/util.py`, `agent/prompts.py`
 - Defines and validates LLM decision contract.
 
 4. Safety Layer
-- File: agent/guardrails.py
-- Implements guardrails-ai based policy gates.
+- File: `agent/guardrails.py`
+- Implements guardrails-ai based policy gates at four enforcement points.
 
 5. Provider Layer
-- Files: llm/base.py, llm/mock_llm.py, llm/azure_openai_llm.py
-- Abstracts model invocation.
+- Files: `llm/base.py`, `llm/factory.py`, `llm/mock_llm.py`, `llm/azure_openai_llm.py`, `llm/openai_llm.py`, `llm/anthropic_llm.py`, `llm/ollama_llm.py`
+- `LLMClient` ABC plus a registry-driven factory and one implementation file per provider.
+- Adding a new provider requires only a new file + one `_register()` call in `factory.py`.
 
 6. Tool Layer
-- Files: mcp_server/mock_tools_server.py, mcp_server/ado_tools_server.py
+- Files: `mcp_server/mock_tools_server.py`, `mcp_server/ado_tools_server.py`
 - Exposes MCP tools and external-system adapters.
+- Swappable via the `--server` CLI flag; orchestrator has no awareness of which server is running.
 
-### 4.2 Process View
+### 5.2 Process View
 
 ```
 +--------------------------------------------------------------+
@@ -72,26 +86,39 @@ System boundary:
 |  - CLI loop                                                  |
 |  - AgentOrchestrator                                         |
 |  - Guardrails                                                |
-|  - LLM client                                                |
+|  - llm/factory.py  ──► LLM provider (selected by env)       |
 +------------------------------+-------------------------------+
                                | stdio (MCP protocol)
 +------------------------------v-------------------------------+
 | Child Process: MCP Server                                    |
-|  - Tool registry                                              |
-|  - Tool handlers (mock/ADO)                                  |
+|  - Tool registry                                             |
+|  - Tool handlers (mock / ADO / custom)                       |
 +--------------------------------------------------------------+
 ```
 
-### 4.3 Deployment Modes
+### 5.3 Provider Selection Flow
 
-Local development:
-- LLM_PROVIDER=mock
-- MCP server: mock_tools_server.py
+```
+AgentOrchestrator.__init__
+  └─► llm/factory.py create_llm(LLM_PROVIDER)
+        ├── "mock"         → MockLLM()                   (built-in, always available)
+        ├── "azure_openai" → AzureOpenAILLM.from_env()   (requires openai SDK)
+        ├── "openai"       → OpenAILLM.from_env()        (requires openai SDK)
+        ├── "anthropic"    → AnthropicLLM.from_env()     (requires anthropic SDK)
+        └── "ollama"       → OllamaLLM.from_env()        (requires openai SDK + local Ollama)
+```
 
-Enterprise integration:
-- LLM_PROVIDER=azure_openai
-- MCP server: ado_tools_server.py
-- Requires AZURE_OPENAI_* and ADO_* env vars
+The factory raises `ValueError` for unknown providers, listing available ones. Each provider's `from_env()` raises `RuntimeError` with a clear message when its required env vars are missing.
+
+### 5.4 Deployment Modes
+
+| Mode | `LLM_PROVIDER` | MCP Server | Required Env Vars |
+|---|---|---|---|
+| Local dev / CI | `mock` | `mock_tools_server.py` | none |
+| Azure OpenAI + ADO | `azure_openai` | `ado_tools_server.py` | `AZURE_OPENAI_*`, `ADO_*` |
+| OpenAI + ADO | `openai` | `ado_tools_server.py` | `OPENAI_API_KEY`, `ADO_*` |
+| Anthropic | `anthropic` | any MCP server | `ANTHROPIC_API_KEY` |
+| Local Ollama | `ollama` | any MCP server | *(optional)* `OLLAMA_BASE_URL`, `OLLAMA_MODEL` |
 
 ## 5. Runtime State Machine
 
@@ -266,13 +293,14 @@ Degradation strategy:
 
 ### 9.1 Constructor Responsibilities
 
-Source: agent/orchestrator.py
+Source: `agent/orchestrator.py`
 
-- Parse runtime limits (MAX_TOOL_STEPS, MAX_HISTORY_MESSAGES).
-- Instantiate Guardrails.
-- Select provider:
-  - mock -> MockLLM
-  - azure_openai -> AzureOpenAILLM.from_env()
+- Parse runtime limits (`MAX_TOOL_STEPS`, `MAX_HISTORY_MESSAGES`).
+- Instantiate `Guardrails`.
+- Call `create_llm(os.getenv("LLM_PROVIDER", "mock"))` from `llm/factory.py`.
+  - Factory resolves provider name → concrete `LLMClient` instance.
+  - No provider-specific `if/elif` logic in the orchestrator itself.
+  - Unknown provider name raises `ValueError` at startup (fail-fast).
 
 ### 9.2 History Management
 
@@ -326,7 +354,7 @@ Rationale:
 
 ### 11.1 Interface
 
-Source: llm/base.py
+Source: `llm/base.py`
 
 ```python
 class LLMClient(ABC):
@@ -335,18 +363,59 @@ class LLMClient(ABC):
         ...
 ```
 
-### 11.2 Mock Provider
+All providers share a single-method interface. The orchestrator only ever calls `complete()` and is unaware of which provider is in use.
 
-Source: llm/mock_llm.py
-- Deterministic branching by user text pattern.
-- Ideal for CI and local behavior validation.
+### 11.2 Provider Registry (`llm/factory.py`)
 
-### 11.3 Azure Provider
+Central registry mapping provider names to factory callables:
 
-Source: llm/azure_openai_llm.py
-- AsyncAzureOpenAI client.
-- from_env() constructor for config centralization.
-- Deterministic configuration (temperature low/controlled path).
+```python
+_REGISTRY: dict[str, Callable[[], LLMClient]] = { ... }
+
+def create_llm(provider: str) -> LLMClient: ...
+```
+
+- Built-in providers are always registered.
+- Optional providers (`azure_openai`, `openai`, `anthropic`, `ollama`) are registered only when their SDK is importable. If the SDK is absent the provider is silently omitted from the registry.
+- `create_llm()` raises `ValueError` on unknown names, listing available options.
+
+To add a new provider: create `llm/my_provider_llm.py`, implement `LLMClient`, and add one `_register("my_provider", MyProvider.from_env)` call in `factory.py`.
+
+### 11.3 Mock Provider
+
+Source: `llm/mock_llm.py`
+- Deterministic branching by user text regex.
+- No API key or network call required.
+- Ideal for CI, offline dev, and unit testing.
+
+### 11.4 Azure OpenAI Provider
+
+Source: `llm/azure_openai_llm.py`
+- `AsyncAzureOpenAI` client from the `openai` SDK.
+- `from_env()` reads `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`, and `AZURE_OPENAI_API_VERSION`.
+- Fixed `temperature=0` for deterministic routing decisions.
+
+### 11.5 OpenAI Provider
+
+Source: `llm/openai_llm.py`
+- `AsyncOpenAI` client from the `openai` SDK.
+- `from_env()` reads `OPENAI_API_KEY` and `OPENAI_MODEL` (default: `gpt-4o`).
+- Shares the same OpenAI-compatible request format as the Azure variant.
+
+### 11.6 Anthropic Provider
+
+Source: `llm/anthropic_llm.py`
+- `AsyncAnthropic` client from the `anthropic` SDK (`pip install anthropic`).
+- `from_env()` reads `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` (default: `claude-opus-4-5`).
+- Protocol adaptation: system messages are passed as the Anthropic `system` parameter; `role=tool` messages from the internal JSON protocol are mapped to `role=user` messages to satisfy the Anthropic API constraint.
+
+### 11.7 Ollama Provider (Local)
+
+Source: `llm/ollama_llm.py`
+- Uses `AsyncOpenAI` client pointed at the Ollama OpenAI-compatible endpoint.
+- `from_env()` reads `OLLAMA_BASE_URL` (default: `http://localhost:11434/v1`) and `OLLAMA_MODEL` (default: `llama3`).
+- No API key required; a placeholder value is used to satisfy the SDK.
+- Enables fully offline / air-gapped deployments.
 
 ## 12. Reliability Model
 
@@ -525,30 +594,68 @@ Optimization levers:
 
 ## 17. Configuration Reference
 
+### Core
+
 | Variable | Default | Description |
 |---|---|---|
-| LLM_PROVIDER | mock | provider selection |
-| MAX_TOOL_STEPS | 5 | max tool iterations/turn |
-| MAX_HISTORY_MESSAGES | 20 | rolling non-system history size |
-| MAX_INPUT_LENGTH | 2000 | input guard limit |
-| MAX_ARG_LENGTH | 1000 | tool arg guard limit |
-| MAX_TOOL_RESULT_LENGTH | 6000 | tool result re-injection guard limit |
-| MAX_OUTPUT_LENGTH | 8000 | output guard limit |
-| SECURITY_MODE | dev | `dev` or strict fail-closed `prod`/`strict` |
-| ALLOWED_TOOLS | empty | optional comma-separated allowlist |
-| LOG_LEVEL | INFO | runtime log level |
-| AZURE_OPENAI_ENDPOINT | - | Azure endpoint |
-| AZURE_OPENAI_API_KEY | - | Azure API key |
-| AZURE_OPENAI_API_VERSION | 2024-12-01-preview | Azure API version |
-| AZURE_OPENAI_DEPLOYMENT | - | Azure deployment name |
-| ADO_ORG | - | Azure DevOps org |
-| ADO_PROJECT | - | Azure DevOps project |
-| ADO_PAT | - | Azure DevOps PAT |
-| ADO_MAX_WIQL_LENGTH | 1000 | max accepted WIQL length |
-| ADO_MAX_RESULTS | 100 | max WIQL result size (capped 200) |
-| ADO_MAX_COMMENTS | 50 | max returned comments |
-| ADO_MAX_COMMENT_LENGTH | 2000 | max comment text length |
-| ADO_INCLUDE_DESCRIPTION | false | include description field when true |
+| `LLM_PROVIDER` | `mock` | Provider selection: `mock`, `azure_openai`, `openai`, `anthropic`, `ollama` |
+| `MAX_TOOL_STEPS` | `5` | Max tool iterations per user turn |
+| `MAX_HISTORY_MESSAGES` | `20` | Rolling non-system history window size |
+| `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+### Guardrails
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_INPUT_LENGTH` | `2000` | Max user input length |
+| `MAX_ARG_LENGTH` | `1000` | Max individual tool argument length |
+| `MAX_TOOL_RESULT_LENGTH` | `6000` | Max tool output re-injected into LLM context |
+| `MAX_OUTPUT_LENGTH` | `8000` | Max final output length |
+| `SECURITY_MODE` | `dev` | `dev` (best-effort) or `prod`/`strict` (fail-closed startup) |
+| `ALLOWED_TOOLS` | *(empty — all allowed)* | Comma-separated allowlist of permitted MCP tool names |
+
+### Azure OpenAI Provider (`LLM_PROVIDER=azure_openai`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `AZURE_OPENAI_ENDPOINT` | — | Azure OpenAI resource endpoint URL |
+| `AZURE_OPENAI_API_KEY` | — | API key |
+| `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | API version string |
+| `AZURE_OPENAI_DEPLOYMENT` | — | Deployment/model name (e.g. `gpt-4o`) |
+
+### OpenAI Provider (`LLM_PROVIDER=openai`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | — | API key from platform.openai.com |
+| `OPENAI_MODEL` | `gpt-4o` | Model name |
+
+### Anthropic Provider (`LLM_PROVIDER=anthropic`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | API key from console.anthropic.com |
+| `ANTHROPIC_MODEL` | `claude-opus-4-5` | Model ID |
+
+### Ollama Provider (`LLM_PROVIDER=ollama`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama server URL (OpenAI-compatible endpoint) |
+| `OLLAMA_MODEL` | `llama3` | Local model name (must be pulled first with `ollama pull <model>`) |
+
+### Azure DevOps MCP Server
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADO_ORG` | — | Azure DevOps organisation slug |
+| `ADO_PROJECT` | — | Project name |
+| `ADO_PAT` | — | Personal Access Token (Work Items read scope) |
+| `ADO_MAX_WIQL_LENGTH` | `1000` | Max accepted WIQL query length |
+| `ADO_MAX_RESULTS` | `100` | Max work items from WIQL query (capped at 200) |
+| `ADO_MAX_COMMENTS` | `50` | Max returned comments |
+| `ADO_MAX_COMMENT_LENGTH` | `2000` | Max length per comment |
+| `ADO_INCLUDE_DESCRIPTION` | `false` | Include description field when true |
 
 ## 18. Engineering Extension Patterns
 
@@ -559,12 +666,18 @@ Optimization levers:
 3. Add or update allowlist policy in env if used.
 4. Add unit test for the tool and one orchestrator integration test.
 
-### 18.2 Add a New Provider
+### 18.2 Add a New LLM Provider
 
-1. Implement LLMClient.complete().
-2. Add provider branch in AgentOrchestrator constructor.
-3. Add provider-specific env validation function.
-4. Add contract tests for strict JSON output.
+1. Create `llm/my_provider_llm.py` with a class that extends `LLMClient` and implements `async complete()`.
+2. Add a `from_env()` static method that reads required env vars and constructs the client.
+3. In `llm/factory.py`, add one line inside the relevant `try/except ImportError` block:
+   ```python
+   from llm.my_provider_llm import MyProviderLLM
+   _register("my_provider", MyProviderLLM.from_env)
+   ```
+4. Set `LLM_PROVIDER=my_provider` in `.env`.
+5. Add provider env vars to `Configuration Reference` in this document and in README.
+6. Add contract tests verifying strict JSON output.
 
 ### 18.3 Add a New Guardrail Policy
 
@@ -615,18 +728,30 @@ Mid-term roadmap:
 
 ## 21. File Responsibility Index
 
-- main.py: bootstrap and runtime composition.
-- agent/orchestrator.py: orchestration state machine.
-- agent/guardrails.py: guardrails-ai policy boundary.
-- agent/prompts.py: model behavior contract text.
-- agent/protocol.py: decision schema model.
-- agent/util.py: parse + schema validation utilities.
-- llm/base.py: provider abstraction.
-- llm/mock_llm.py: deterministic local provider.
-- llm/azure_openai_llm.py: Azure provider.
-- mcp_server/mock_tools_server.py: demo MCP tools.
-- mcp_server/ado_tools_server.py: ADO MCP tools.
+| File | Responsibility |
+|---|---|
+| `main.py` | Bootstrap: arg parsing, env load, logging, orchestrator launch |
+| `agent/orchestrator.py` | Turn state machine; MCP lifecycle; delegates provider selection to factory |
+| `agent/guardrails.py` | guardrails-ai policy enforcement at four boundaries |
+| `agent/prompts.py` | System prompt text and tool catalog formatter |
+| `agent/protocol.py` | Pydantic `LLMDecision` schema |
+| `agent/util.py` | JSON parse and schema validation helpers |
+| `llm/base.py` | `LLMClient` abstract base class |
+| `llm/factory.py` | Provider registry and `create_llm()` factory function |
+| `llm/mock_llm.py` | Deterministic local provider (no SDK required) |
+| `llm/azure_openai_llm.py` | Azure OpenAI provider |
+| `llm/openai_llm.py` | Standard OpenAI provider |
+| `llm/anthropic_llm.py` | Anthropic Claude provider |
+| `llm/ollama_llm.py` | Ollama local model provider |
+| `mcp_server/mock_tools_server.py` | FastMCP demo server (`greet`, `get_defect_details`) |
+| `mcp_server/ado_tools_server.py` | FastMCP ADO server (`get_work_item`, `list_work_items`, `get_work_item_comments`) |
 
 ## 22. Conclusion
 
-Chat-Ai uses a clean separation of concerns: host orchestration, provider abstraction, and out-of-process tool execution through MCP. With strict contracts and explicit guardrail boundaries, the design is practical for local experimentation and extensible for enterprise-grade hardening.
+Chat-Ai is structured around three orthogonal axes of extensibility:
+
+1. **LLM Provider** — any model API can be used by adding a single file to `llm/` and one line to `llm/factory.py`. The orchestrator has no provider-specific code.
+2. **Tool Capability** — any MCP-compliant stdio server can be plugged in via the `--server` flag. The host discovers tools dynamically at startup.
+3. **Safety Policy** — guardrails enforcement at four explicit pipeline boundaries is independently configurable per environment.
+
+This separation keeps each concern testable in isolation, allows incremental hardening, and lets teams swap or extend any layer without touching the others.

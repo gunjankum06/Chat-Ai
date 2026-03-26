@@ -5,10 +5,9 @@ from llm.base import LLMClient
 
 class MockLLM(LLMClient):
     """
-    A deterministic mock LLM used to prove the loop works:
-      - If user asks for defect details, it calls get_defect_details.
-      - If user says greet <name>, it calls greet.
-      - Otherwise, final.
+    Deterministic mock LLM for local development and testing.
+    Recognises a small set of patterns and routes them to MCP tools;
+    falls back to a final text answer for everything else.
     """
     async def complete(self, messages: List[Dict[str, Any]]) -> str:
         # If the last message is a tool result, return its content as the final answer.
@@ -35,5 +34,5 @@ class MockLLM(LLMClient):
             defect_id = m.group(1) or m.group(2)
             return json.dumps({"type": "tool_call", "name": "get_defect_details", "arguments": {"defectId": defect_id}})
 
-        # default: no tool
-        return json.dumps({"type": "final", "content": "I can greet you or fetch mock defect details. Try: 'greet Gunjan' or 'get defect 1234 details'."})
+        # default: no tool needed
+        return json.dumps({"type": "final", "content": "I'm a mock LLM. Try: 'greet <name>' or 'get defect <id>'."})
