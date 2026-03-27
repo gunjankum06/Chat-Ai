@@ -12,6 +12,7 @@ from mcp.client.stdio import stdio_client
 
 from agent.guardrails import Guardrails, GuardrailViolation
 from agent.prompts import SYSTEM_PROMPT, tools_to_compact_text
+from agent.tracing import traceable
 from agent.util import safe_parse_llm_json, validate_decision
 
 from llm.base import LLMClient
@@ -89,7 +90,7 @@ class AgentOrchestrator:
                     messages.append({"role": "user", "content": user})
 
                     try:
-                        final_text = await self._run_agent_loop(session=session, messages=messages)
+                        final_text = await self._handle_turn(session=session, messages=messages, user_input=user)
                     except Exception as exc:
                         logger.exception("Agent loop failed")
                         final_text = "Sorry, something went wrong while processing your request."
@@ -104,6 +105,12 @@ class AgentOrchestrator:
                     messages.append({"role": "assistant", "content": final_text})
                     messages = self._trim_history(messages)
 
+    @traceable(run_type="chain", name="agent_turn")
+    async def _handle_turn(self, *, session: ClientSession, messages: List[Dict[str, Any]], user_input: str) -> str:
+        """Traced wrapper around the agent loop for one user turn."""
+        return await self._run_agent_loop(session=session, messages=messages)
+
+    @traceable(run_type="chain", name="agent_loop")
     async def _run_agent_loop(self, session: ClientSession, messages: List[Dict[str, Any]]) -> str:
         """
         Tool loop:

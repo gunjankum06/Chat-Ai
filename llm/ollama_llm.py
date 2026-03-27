@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 from openai import AsyncOpenAI
 
 from llm.base import LLMClient
+from agent.tracing import traceable
 
 
 class OllamaLLM(LLMClient):
@@ -29,6 +30,7 @@ class OllamaLLM(LLMClient):
         client = AsyncOpenAI(base_url=base_url, api_key="ollama")
         return OllamaLLM(client, model)
 
+    @traceable(run_type="llm", name="ollama_complete")
     async def complete(self, messages: List[Dict[str, Any]]) -> str:
         response = await self.client.chat.completions.create(
             model=self.model,

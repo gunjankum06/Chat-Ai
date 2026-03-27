@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 from openai import AsyncAzureOpenAI
 
 from llm.base import LLMClient
+from agent.tracing import traceable
 
 class AzureOpenAILLM(LLMClient):
     """
@@ -27,6 +28,7 @@ class AzureOpenAILLM(LLMClient):
         )
         return AzureOpenAILLM(client, deployment)
 
+    @traceable(run_type="llm", name="azure_openai_complete")
     async def complete(self, messages: List[Dict[str, Any]]) -> str:
         response = await self.client.chat.completions.create(
             model=self.deployment,

@@ -2,6 +2,7 @@ import os
 from typing import List, Dict, Any
 
 from llm.base import LLMClient
+from agent.tracing import traceable
 
 
 class AnthropicLLM(LLMClient):
@@ -27,6 +28,7 @@ class AnthropicLLM(LLMClient):
         client = anthropic.AsyncAnthropic(api_key=api_key)
         return AnthropicLLM(client, model)
 
+    @traceable(run_type="llm", name="anthropic_complete")
     async def complete(self, messages: List[Dict[str, Any]]) -> str:
         # Anthropic requires the system prompt as a separate top-level parameter.
         # Tool results from our custom JSON protocol are sent as plain user messages.

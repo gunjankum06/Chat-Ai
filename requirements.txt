@@ -8,5 +8,8 @@ rich
 openai        # required for: azure_openai, openai, ollama (OpenAI-compatible)
 # anthropic   # required for: anthropic  (pip install anthropic)
 
+# Observability (optional)
+# langsmith   # required for: LangSmith tracing  (pip install langsmith)
+
 requests
 guardrails-ai>=0.5.0

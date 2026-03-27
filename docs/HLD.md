@@ -13,6 +13,7 @@ Audience:
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.3.0 | 2026-03-27 | LangSmith observability: added `agent/tracing.py` with opt-in `@traceable` decorator; traced agent turns, agent loop, and all LLM provider `complete()` calls; zero overhead when disabled; extended HLD §14 with trace architecture, security model, and evaluation workflow |
 | 1.2.0 | 2026-03-26 | Generic LLM provider architecture: added `openai`, `anthropic`, `ollama` providers; introduced `llm/factory.py` registry; provider selection fully env-driven; removed hardcoded provider branches from orchestrator |
 | 1.1.0 | 2026-03-20 | Security hardening: tool-result guardrail, fail-closed prod mode, ADO WIQL policy controls, raw exception sanitization |
 | 1.0.0 | 2026-03-01 | Initial architecture: mock + Azure OpenAI providers, ADO MCP server, guardrails-ai integration |
@@ -28,6 +29,7 @@ In scope:
 - Provider registry with zero-configuration registration pattern.
 - Guardrails-ai policy enforcement on input/tool-call/output.
 - Deterministic orchestration with strict JSON decision schema.
+- Optional LangSmith observability (tracing of turns, LLM calls, tool calls).
 
 Out of scope:
 - Multi-tenant SaaS serving layer.
@@ -527,6 +529,114 @@ Even after controls above, LLM-based systems retain residual model risk (halluci
 
 ## 14. Observability and Telemetry
 
+### 14.1 LangSmith Integration
+
+Source: `agent/tracing.py`
+
+When `LANGSMITH_TRACING=true` and the `langsmith` SDK is installed, every agent turn, agent loop iteration, and LLM `complete()` call is traced to [LangSmith](https://smith.langchain.com). This provides:
+
+- Full trace tree per user turn (turn → loop → LLM call / tool call).
+- Input/output capture for debugging and evaluation.
+- Latency and token-usage visibility.
+- Dataset curation for offline evaluation.
+
+#### 14.1.1 Architecture Decision
+
+LangSmith was chosen over alternatives (OpenTelemetry, Langfuse, custom logging) because:
+
+1. **No LangChain dependency** — the standalone `langsmith` SDK (`pip install langsmith`) works with any Python code. No framework lock-in.
+2. **Decorator-based instrumentation** — a single `@traceable` decorator on existing functions. Zero refactoring of business logic.
+3. **Native LLM run types** — spans can be typed as `chain`, `llm`, `tool`, producing structured trace trees purpose-built for agent debugging.
+4. **Evaluation infrastructure** — traced runs can be added to datasets and scored with custom evaluators, enabling regression testing of prompt/model changes.
+5. **Graceful degradation** — all instrumentation is behind a no-op guard. When `LANGSMITH_TRACING` is not `true` or the SDK is absent, decorated functions execute with zero overhead.
+
+#### 14.1.2 Trace Tree Structure
+
+A single user turn produces a nested trace tree:
+
+```
+agent_turn  (chain)                          ← one per "You> ..." input
+ └── agent_loop  (chain)                      ← tool-calling loop
+      ├── <provider>_complete  (llm)           ← 1st LLM call
+      ├── [MCP tool call not yet traced]       ← tool execution
+      ├── <provider>_complete  (llm)           ← 2nd LLM call (after tool result)
+      └── ...                                  ← repeats until "final"
+```
+
+Each span captures:
+- **Inputs**: message history (for LLM spans), user input (for turn spans).
+- **Outputs**: raw LLM response text, final answer.
+- **Metadata**: provider name, run type, custom tags.
+- **Timing**: start/end timestamps, latency.
+
+#### 14.1.3 Implementation Pattern
+
+The `agent/tracing.py` module provides a unified `@traceable` decorator:
+
+```python
+from agent.tracing import traceable
+
+@traceable(run_type="llm", name="openai_complete")
+async def complete(self, messages):
+    ...
+```
+
+Internally:
+1. At module load, `tracing.py` checks `LANGSMITH_TRACING` env var.
+2. If `true`, it attempts to import `langsmith.traceable`.
+3. If import succeeds, `@traceable` delegates to the real LangSmith decorator.
+4. If import fails or tracing is off, `@traceable` returns the original function unchanged.
+
+This means:
+- **Dev/CI environments** need no configuration — tracing is off by default.
+- **Staging/prod** enable tracing with two env vars (`LANGSMITH_TRACING`, `LANGSMITH_API_KEY`).
+- Provider modules have no direct `langsmith` imports — all instrumentation goes through the thin `tracing.py` abstraction.
+
+#### 14.1.4 Traced Components
+
+| Decorator location | `run_type` | `name` | What it captures |
+|---|---|---|---|
+| `AgentOrchestrator._handle_turn` | `chain` | `agent_turn` | Full user turn: input → final answer |
+| `AgentOrchestrator._run_agent_loop` | `chain` | `agent_loop` | Inner multi-step tool loop |
+| `AzureOpenAILLM.complete` | `llm` | `azure_openai_complete` | Single Azure OpenAI API call |
+| `OpenAILLM.complete` | `llm` | `openai_complete` | Single OpenAI API call |
+| `AnthropicLLM.complete` | `llm` | `anthropic_complete` | Single Anthropic API call |
+| `OllamaLLM.complete` | `llm` | `ollama_complete` | Single Ollama API call |
+
+The `MockLLM` is intentionally **not** traced — it is deterministic and used only for testing.
+
+#### 14.1.5 Data Security Considerations
+
+- **What is sent to LangSmith**: function inputs/outputs, timing, metadata. For LLM spans this includes the full message history and model response.
+- **Sensitive data risk**: if conversations contain PII, secrets, or confidential content, that data will flow to the LangSmith API.
+- **Mitigations**:
+  - Keep tracing disabled (`LANGSMITH_TRACING=false`) in environments handling sensitive data unless LangSmith is self-hosted.
+  - Use a self-hosted LangSmith instance for enterprise deployments (set `LANGSMITH_ENDPOINT` to your internal URL).
+  - LangSmith supports project-level access controls and data retention policies.
+  - Guardrails redaction runs *before* the traced functions, so secrets caught by `check_input` or `check_tool_result` are already stripped.
+
+#### 14.1.6 Evaluation Workflow
+
+LangSmith traces enable a structured evaluation loop:
+
+1. **Collect** — run the agent with tracing enabled; turns are logged automatically.
+2. **Curate** — in the LangSmith UI, select interesting turns and add them to a dataset.
+3. **Evaluate** — write custom evaluator functions (e.g. "did the agent call the right tool?", "is the final answer correct?") and run them against the dataset.
+4. **Compare** — after changing a prompt or swapping a model, re-evaluate the same dataset and compare scores.
+
+This replaces ad-hoc manual testing with repeatable, version-tracked evaluations.
+
+Required env vars (when enabled):
+
+| Variable | Default | Description |
+|---|---|---|
+| `LANGSMITH_TRACING` | `false` | Set to `true` to enable |
+| `LANGSMITH_API_KEY` | — | API key from smith.langchain.com |
+| `LANGSMITH_PROJECT` | `Chat-Ai` | Project name in LangSmith dashboard |
+| `LANGSMITH_ENDPOINT` | `https://api.smith.langchain.com` | API endpoint URL (override for self-hosted) |
+
+### 14.2 Logging
+
 Current:
 - Standard Python logging.
 
@@ -708,6 +818,27 @@ Pre-release checklist:
 2. Run test suite.
 3. Validate enterprise secrets are set for integration mode.
 4. Run one end-to-end interactive smoke test.
+5. If LangSmith is enabled, verify traces appear in the dashboard after smoke test.
+
+### 19.1 LangSmith Verification
+
+```bash
+# 1. Enable tracing
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=lsv2_...
+export LANGSMITH_PROJECT=Chat-Ai
+
+# 2. Run agent and interact
+python main.py --server python mcp_server/mock_tools_server.py
+# You> greet Ada
+# You> get defect 1234
+# You> exit
+
+# 3. Check dashboard at https://smith.langchain.com
+#    - Verify project "Chat-Ai" exists
+#    - Verify 2 trace trees (one per turn)
+#    - Each tree should show agent_turn → agent_loop → <provider>_complete
+```
 
 ## 20. Limitations and Roadmap
 
@@ -720,6 +851,8 @@ Near-term roadmap:
 - Structured telemetry and turn correlation IDs.
 - Better retry/backoff and timeout policies.
 - Integration test harness with mocked MCP transport.
+- Trace MCP tool calls as `tool` run-type spans in LangSmith.
+- LangSmith dataset-based evaluation pipeline in CI.
 
 Mid-term roadmap:
 - API facade for multi-client access.
@@ -733,6 +866,7 @@ Mid-term roadmap:
 | `main.py` | Bootstrap: arg parsing, env load, logging, orchestrator launch |
 | `agent/orchestrator.py` | Turn state machine; MCP lifecycle; delegates provider selection to factory |
 | `agent/guardrails.py` | guardrails-ai policy enforcement at four boundaries |
+| `agent/tracing.py` | LangSmith `@traceable` decorator; no-op when tracing is off; auto-detects SDK and `LANGSMITH_TRACING` env var |
 | `agent/prompts.py` | System prompt text and tool catalog formatter |
 | `agent/protocol.py` | Pydantic `LLMDecision` schema |
 | `agent/util.py` | JSON parse and schema validation helpers |

@@ -76,6 +76,7 @@ Chat-Ai/
 ├── agent/
 │   ├── orchestrator.py          # Core agent loop (CLI ↔ LLM ↔ MCP)
 │   ├── guardrails.py            # guardrails-ai Guard wrappers (input / tool / output)
+│   ├── tracing.py               # LangSmith @traceable decorator (no-op when off)
 │   ├── prompts.py               # System prompt + tool-text formatter
 │   ├── protocol.py              # Pydantic models: LLMDecision schema
 │   └── util.py                  # JSON parsing + LLMDecision validation helpers
@@ -272,6 +273,82 @@ guardrails hub install hub://guardrails/toxic_language   # optional
 
 ---
 
+## LangSmith Observability (Optional)
+
+[LangSmith](https://smith.langchain.com) provides full-stack tracing for every agent turn — LLM calls, tool calls, latencies, inputs/outputs — with zero code changes beyond env vars. It does **not** require LangChain; the standalone `langsmith` SDK works with this project’s custom orchestrator directly.
+
+### Setup
+
+```bash
+pip install langsmith
+```
+
+### Configuration
+
+```bash
+# .env
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_PROJECT=Chat-Ai                        # optional (default: Chat-Ai)
+# LANGSMITH_ENDPOINT=https://api.smith.langchain.com  # optional (override for self-hosted)
+```
+
+### What gets traced
+
+Every user turn produces a nested trace tree:
+
+```
+agent_turn  (chain)                          ← one per user message
+ └── agent_loop  (chain)                      ← tool-calling loop
+      ├── <provider>_complete  (llm)           ← 1st LLM API call
+      ├── [tool execution]                    ← MCP tool call
+      ├── <provider>_complete  (llm)           ← 2nd LLM call (with tool result)
+      └── ...                                  ← repeats until "final"
+```
+
+| Span | Type | Description |
+|---|---|---|
+| `agent_turn` | chain | One span per user interaction (top-level) |
+| `agent_loop` | chain | Inner tool-calling loop |
+| `azure_openai_complete` | llm | Azure OpenAI API call |
+| `openai_complete` | llm | Standard OpenAI API call |
+| `anthropic_complete` | llm | Anthropic Claude API call |
+| `ollama_complete` | llm | Ollama local model API call |
+
+### How it works
+
+The `agent/tracing.py` module provides a `@traceable` decorator that:
+1. Checks `LANGSMITH_TRACING` env var at import time.
+2. If `true`, imports `langsmith.traceable` and delegates to it.
+3. If `false` or SDK is missing, returns the original function unchanged — **zero overhead**.
+
+Provider code never imports `langsmith` directly. All instrumentation goes through `tracing.py`, making it trivial to swap to a different tracing backend in the future.
+
+### Evaluation workflow
+
+LangSmith traces enable a structured evaluation loop:
+
+1. **Collect** — run the agent with tracing on; turns are logged automatically.
+2. **Curate** — select interesting turns in the LangSmith UI and add them to a dataset.
+3. **Evaluate** — write evaluator functions ("did the agent call the right tool?") and score the dataset.
+4. **Compare** — after changing a prompt or model, re-evaluate the same dataset and diff scores.
+
+### Self-hosted / air-gapped deployments
+
+Set `LANGSMITH_ENDPOINT` to your internal LangSmith URL. All other env vars work the same. This keeps trace data within your network boundary. 
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No traces appear | `LANGSMITH_TRACING` is not `true` | Set `LANGSMITH_TRACING=true` in `.env` |
+| `langsmith SDK is not installed` warning | SDK missing from venv | `pip install langsmith` |
+| Traces appear but are empty | Functions not decorated | Verify `@traceable` on `_handle_turn`, `_run_agent_loop`, `complete()` |
+| Authentication error | Invalid API key | Verify `LANGSMITH_API_KEY` at smith.langchain.com → Settings |
+| Wrong project | `LANGSMITH_PROJECT` mismatch | Set the correct project name in `.env` |
+
+---
+
 ## Security Audit (March 2026)
 
 This project was reviewed with a production mindset for shipping to multiple users. Findings were ranked by severity and the critical controls below have been implemented.
@@ -400,7 +477,8 @@ All providers speak the same `LLMClient.complete()` interface defined in `llm/ba
 |---|---|
 | `__init__(server_command)` | Calls `create_llm(LLM_PROVIDER)` from `llm/factory.py`; instantiates `Guardrails`; stores MCP server command |
 | `run_cli()` | Spawns MCP subprocess, discovers tools, starts interactive loop; applies input + output guardrails |
-| `_run_agent_loop(session, messages)` | Iterates LLM ↔ tool calls until `type=final` or step limit; applies tool-call and tool-result guardrails |
+| `_handle_turn(session, messages, user_input)` | Traced wrapper (`agent_turn` span) around the agent loop for one user turn |
+| `_run_agent_loop(session, messages)` | Traced inner loop (`agent_loop` span); iterates LLM ↔ tool calls until `type=final` or step limit |
 
 ### `agent/guardrails.py` — `Guardrails`
 
@@ -430,6 +508,17 @@ Pydantic models that enforce the LLM output contract:
 
 - `safe_parse_llm_json(text)` — strips whitespace and parses JSON
 - `validate_decision(obj)` — validates parsed JSON against `LLMDecision`
+
+### `agent/tracing.py` — LangSmith observability
+
+Provides a `@traceable` decorator that wraps functions with LangSmith tracing when `LANGSMITH_TRACING=true` and the `langsmith` SDK is installed. Falls back to a transparent no-op otherwise (zero overhead).
+
+| Function / attribute | Purpose |
+|---|---|
+| `traceable(run_type, name, metadata, tags)` | Decorator: delegates to `langsmith.traceable` when active, no-op when off |
+| `is_tracing_enabled()` | Returns `True` when LangSmith tracing is active |
+
+Applied to: `_handle_turn` (chain), `_run_agent_loop` (chain), and each provider’s `complete()` (llm). `MockLLM` is intentionally not traced.
 
 ### `llm/base.py` — `LLMClient` (ABC)
 
@@ -491,6 +580,7 @@ A [FastMCP](https://github.com/jlowin/fastmcp) stdio server with two demo tools:
 | `guardrails-ai` | Input / tool-call / output safety guardrails framework |
 | `openai` | Required for: `azure_openai`, `openai`, `ollama` providers |
 | `anthropic` *(optional)* | Required for: `anthropic` provider (`pip install anthropic`) |
+| `langsmith` *(optional)* | Required for: LangSmith tracing (`pip install langsmith`) |
 
 ---
 
