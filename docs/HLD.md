@@ -13,6 +13,7 @@ Audience:
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.4.0 | 2026-04-01 | Mock flow end-to-end verified; documented known runtime issues — guardrails hub validators require separate install (`guardrails hub install`), venv must be activated for module resolution, Windows `pip` shebang can break after directory rename (use `python -m pip`); added §19.2 Known Issues and §19.3 Troubleshooting |
 | 1.3.1 | 2026-04-01 | Trace data protection: added `process_inputs` redaction to `@traceable` — secrets, PII (email, phone, SSN), and system prompts are scrubbed before being sent to LangSmith; controlled by `LANGSMITH_REDACT` (default: true) |
 | 1.3.0 | 2026-03-27 | LangSmith observability: added `agent/tracing.py` with opt-in `@traceable` decorator; traced agent turns, agent loop, and all LLM provider `complete()` calls; zero overhead when disabled; extended HLD §14 with trace architecture, security model, and evaluation workflow |
 | 1.2.0 | 2026-03-26 | Generic LLM provider architecture: added `openai`, `anthropic`, `ollama` providers; introduced `llm/factory.py` registry; provider selection fully env-driven; removed hardcoded provider branches from orchestrator |
@@ -888,6 +889,30 @@ python main.py --server python mcp_server/mock_tools_server.py
 #    - Verify 2 trace trees (one per turn)
 #    - Each tree should show agent_turn → agent_loop → <provider>_complete
 ```
+
+### 19.2 Known Issues
+
+The following issues have been identified during mock flow and integration testing:
+
+| ID | Severity | Issue | Root Cause | Workaround |
+|---|---|---|---|---|
+| KI-01 | Low | `ValidLength not installed` and `DetectPromptInjection not installed` warnings on startup | Hub validators are not bundled with `guardrails-ai`; they must be installed separately via the guardrails CLI | Run `guardrails hub install hub://guardrails/valid_length` and `guardrails hub install hub://guardrails/detect_prompt_injection` before first run |
+| KI-02 | Low | `ModuleNotFoundError: No module named 'guardrails'` when running from a terminal without the venv activated | Background/new terminal sessions do not inherit the virtual environment | Always activate the venv first: `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (Linux/macOS) |
+| KI-03 | Low | `pip install` fails with `No such file or directory` on Windows after renaming the project folder | The pip shebang in `.venv/Scripts/pip.exe` hardcodes the original venv creation path | Use `python -m pip install` instead of bare `pip` |
+| KI-04 | Info | Agent runs as an interactive CLI; stdin must be a real terminal | Piping stdout through commands (e.g. `Select-Object`) closes stdin and causes `EOFError` | Run the agent directly in an interactive terminal without output piping |
+
+None of these issues affect core agent functionality when the environment is set up correctly.
+
+### 19.3 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ValidLength not installed` / `DetectPromptInjection not installed` warnings | Hub validators not installed | `guardrails hub install hub://guardrails/valid_length` and `guardrails hub install hub://guardrails/detect_prompt_injection` |
+| `ModuleNotFoundError: No module named 'guardrails'` | Virtual environment not activated | Activate venv: `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (macOS/Linux) |
+| `pip` command fails with path error on Windows | Pip shebang references old directory path | Use `python -m pip` instead of bare `pip` |
+| `EOFError` at `You>` prompt | stdin closed by output piping or non-interactive shell | Run the agent directly in an interactive terminal |
+| `RuntimeError: SECURITY_MODE is strict but required guardrails validators are missing` | `SECURITY_MODE=prod` but hub validators not installed | Install all required hub validators, or set `SECURITY_MODE=dev` for local development |
+| Agent exits after `Connected to MCP server` with no prompt | MCP server process crashed | Check the `--server` command is correct and the MCP server script has no syntax errors |
 
 ## 20. Limitations and Roadmap
 

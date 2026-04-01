@@ -611,6 +611,29 @@ A [FastMCP](https://github.com/jlowin/fastmcp) stdio server with two demo tools:
 
 ---
 
+## Known Issues
+
+| Issue | Severity | Description | Workaround |
+|---|---|---|---|
+| Hub validators not bundled | Low | `ValidLength` and `DetectPromptInjection` show "not installed" warnings at startup | Run `guardrails hub install hub://guardrails/valid_length` and `guardrails hub install hub://guardrails/detect_prompt_injection` |
+| Venv must be activated | Low | `ModuleNotFoundError` for `guardrails` or other packages when the virtual environment is not active | Always activate the venv before running: `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (macOS/Linux) |
+| Pip shebang breaks on Windows after folder rename | Low | Bare `pip` fails if the project directory was renamed after venv creation | Use `python -m pip install` instead of `pip install` |
+| Interactive terminal required | Info | The agent reads from stdin; piping output through filters causes `EOFError` | Run the agent directly in a terminal without output redirection |
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ValidLength not installed` warning | Hub validators missing | `guardrails hub install hub://guardrails/valid_length` |
+| `DetectPromptInjection not installed` warning | Hub validators missing | `guardrails hub install hub://guardrails/detect_prompt_injection` |
+| `ModuleNotFoundError: No module named 'guardrails'` | Venv not activated | Activate: `.venv\Scripts\activate` (Win) / `source .venv/bin/activate` (macOS/Linux) |
+| `pip` fails with path error | Pip shebang stale after folder rename | `python -m pip install -r requirements.txt` |
+| `EOFError` at `You>` prompt | stdin closed (piped output) | Run the agent in an interactive terminal |
+| `SECURITY_MODE is strict but required guardrails validators are missing` | `SECURITY_MODE=prod` without hub validators | Install validators or set `SECURITY_MODE=dev` |
+| No `You>` prompt after MCP connection | MCP server process crashed | Verify `--server` command and check MCP server script for errors |
+
+---
+
 ## License
 
 MIT
