@@ -13,6 +13,7 @@ Audience:
 
 | Version | Date | Summary |
 |---|---|---|
+| 1.3.1 | 2026-04-01 | Trace data protection: added `process_inputs` redaction to `@traceable` — secrets, PII (email, phone, SSN), and system prompts are scrubbed before being sent to LangSmith; controlled by `LANGSMITH_REDACT` (default: true) |
 | 1.3.0 | 2026-03-27 | LangSmith observability: added `agent/tracing.py` with opt-in `@traceable` decorator; traced agent turns, agent loop, and all LLM provider `complete()` calls; zero overhead when disabled; extended HLD §14 with trace architecture, security model, and evaluation workflow |
 | 1.2.0 | 2026-03-26 | Generic LLM provider architecture: added `openai`, `anthropic`, `ollama` providers; introduced `llm/factory.py` registry; provider selection fully env-driven; removed hardcoded provider branches from orchestrator |
 | 1.1.0 | 2026-03-20 | Security hardening: tool-result guardrail, fail-closed prod mode, ADO WIQL policy controls, raw exception sanitization |
@@ -607,13 +608,60 @@ The `MockLLM` is intentionally **not** traced — it is deterministic and used o
 
 #### 14.1.5 Data Security Considerations
 
-- **What is sent to LangSmith**: function inputs/outputs, timing, metadata. For LLM spans this includes the full message history and model response.
-- **Sensitive data risk**: if conversations contain PII, secrets, or confidential content, that data will flow to the LangSmith API.
-- **Mitigations**:
-  - Keep tracing disabled (`LANGSMITH_TRACING=false`) in environments handling sensitive data unless LangSmith is self-hosted.
-  - Use a self-hosted LangSmith instance for enterprise deployments (set `LANGSMITH_ENDPOINT` to your internal URL).
-  - LangSmith supports project-level access controls and data retention policies.
-  - Guardrails redaction runs *before* the traced functions, so secrets caught by `check_input` or `check_tool_result` are already stripped.
+##### What is sent to LangSmith
+
+When tracing is enabled, every `@traceable`-decorated function sends its inputs and outputs to the LangSmith API. For this project that includes:
+
+| Traced data | Source | Risk |
+|---|---|---|
+| Message history | `messages` list passed to LLM | May contain user PII, tool results with business data, secrets |
+| System prompt | First message in history | Reveals tool schemas, internal instructions, routing logic |
+| LLM responses | Raw model output | May echo sensitive input or hallucinate secrets |
+| Tool results | MCP tool output appended as `role=tool` | May contain work-item data, names, internal IDs |
+| User input | `user_input` parameter on `_handle_turn` | Free-form text from the user |
+
+##### Built-in redaction (`LANGSMITH_REDACT`)
+
+By default (`LANGSMITH_REDACT=true`), the `_process_inputs` callback in `agent/tracing.py` scrubs all traced inputs **before** they leave the process. The original runtime objects are never mutated.
+
+Redaction layers:
+
+| Layer | What is matched | Replacement |
+|---|---|---|
+| System prompt | Any message with `role=system` | `[system prompt redacted]` |
+| Secrets | API keys (`sk-*`, `lsv2_*`, `sk-ant-*`, `ghp_*`), bearer tokens, password/secret/pat assignments | `[redacted-secret]` |
+| Email addresses | Standard email pattern | `[redacted-email]` |
+| Phone numbers | North American formats (with/without country code) | `[redacted-phone]` |
+| SSNs | `NNN-NN-NNNN` pattern | `[redacted-ssn]` |
+
+Secret patterns are aligned with `agent/guardrails.py` `_secret_patterns` plus additional coverage for OpenAI, Anthropic, and LangSmith key formats.
+
+To disable redaction (e.g. for a fully trusted self-hosted instance where you need raw data for evaluation):
+```
+LANGSMITH_REDACT=false
+```
+
+##### Defence-in-depth: redaction ordering
+
+Sensitive data passes through multiple filters before reaching LangSmith:
+
+```
+User input
+  └─► guardrails.check_input()         ← blocks injection, enforces length
+       └─► [appended to messages]
+            └─► guardrails.check_tool_result()  ← redacts secrets, blocks injection in tool output
+                 └─► tracing._process_inputs()     ← redacts PII, secrets, system prompt in trace payload
+                      └─► LangSmith API
+```
+
+Even if a secret bypasses guardrails regex patterns, the tracing redaction layer provides a second opportunity to catch it before it leaves the process.
+
+##### Additional mitigations
+
+- **Disable tracing in production**: keep `LANGSMITH_TRACING=false` in environments with real user data.
+- **Self-host LangSmith**: set `LANGSMITH_ENDPOINT` to an internal URL; data never leaves your network.
+- **Project-level access controls**: use LangSmith’s RBAC and data retention policies.
+- **Audit**: periodically review traces in the LangSmith dashboard to verify no unexpected data appears.
 
 #### 14.1.6 Evaluation Workflow
 
@@ -634,6 +682,7 @@ Required env vars (when enabled):
 | `LANGSMITH_API_KEY` | — | API key from smith.langchain.com |
 | `LANGSMITH_PROJECT` | `Chat-Ai` | Project name in LangSmith dashboard |
 | `LANGSMITH_ENDPOINT` | `https://api.smith.langchain.com` | API endpoint URL (override for self-hosted) |
+| `LANGSMITH_REDACT` | `true` | Redact PII/secrets/system prompts from trace payloads; set to `false` only on trusted self-hosted instances |
 
 ### 14.2 Logging
 

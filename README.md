@@ -291,6 +291,7 @@ LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=lsv2_...
 LANGSMITH_PROJECT=Chat-Ai                        # optional (default: Chat-Ai)
 # LANGSMITH_ENDPOINT=https://api.smith.langchain.com  # optional (override for self-hosted)
+# LANGSMITH_REDACT=true                               # optional (default: true — redacts PII/secrets from traces)
 ```
 
 ### What gets traced
@@ -321,8 +322,32 @@ The `agent/tracing.py` module provides a `@traceable` decorator that:
 1. Checks `LANGSMITH_TRACING` env var at import time.
 2. If `true`, imports `langsmith.traceable` and delegates to it.
 3. If `false` or SDK is missing, returns the original function unchanged — **zero overhead**.
+4. When `LANGSMITH_REDACT=true` (the default), a `process_inputs` callback scrubs all traced inputs before they leave the process.
 
 Provider code never imports `langsmith` directly. All instrumentation goes through `tracing.py`, making it trivial to swap to a different tracing backend in the future.
+
+### Data protection
+
+By default, traced inputs are **automatically redacted** before being sent to LangSmith. The original runtime objects are never mutated.
+
+| What is redacted | Example match | Replacement |
+|---|---|---|
+| System prompt | `role=system` messages | `[system prompt redacted]` |
+| API keys & secrets | `sk-abc123...`, `Bearer eyJ...`, `pat=...` | `[redacted-secret]` |
+| Email addresses | `user@example.com` | `[redacted-email]` |
+| Phone numbers | `+1 (555) 123-4567` | `[redacted-phone]` |
+| SSNs | `123-45-6789` | `[redacted-ssn]` |
+
+Redaction runs **after** guardrails (`check_input`, `check_tool_result`) and **before** the LangSmith API call, giving two independent layers of protection:
+
+```
+guardrails.check_input()  →  guardrails.check_tool_result()  →  tracing._process_inputs()  →  LangSmith API
+```
+
+To disable redaction on a trusted self-hosted instance (e.g. for raw evaluation data):
+```bash
+LANGSMITH_REDACT=false
+```
 
 ### Evaluation workflow
 
@@ -335,7 +360,7 @@ LangSmith traces enable a structured evaluation loop:
 
 ### Self-hosted / air-gapped deployments
 
-Set `LANGSMITH_ENDPOINT` to your internal LangSmith URL. All other env vars work the same. This keeps trace data within your network boundary. 
+Set `LANGSMITH_ENDPOINT` to your internal LangSmith URL. All other env vars work the same. This keeps trace data within your network boundary. Consider setting `LANGSMITH_REDACT=false` on a fully trusted self-hosted instance if you need unredacted data for evaluation.
 
 ### Troubleshooting
 
@@ -346,6 +371,8 @@ Set `LANGSMITH_ENDPOINT` to your internal LangSmith URL. All other env vars work
 | Traces appear but are empty | Functions not decorated | Verify `@traceable` on `_handle_turn`, `_run_agent_loop`, `complete()` |
 | Authentication error | Invalid API key | Verify `LANGSMITH_API_KEY` at smith.langchain.com → Settings |
 | Wrong project | `LANGSMITH_PROJECT` mismatch | Set the correct project name in `.env` |
+| Traces show `[redacted-*]` placeholders | `LANGSMITH_REDACT=true` (default) | Expected behaviour; set `LANGSMITH_REDACT=false` only on trusted self-hosted instances |
+| Secrets visible in traces | `LANGSMITH_REDACT=false` | Set `LANGSMITH_REDACT=true` (or remove the var — defaults to true) |
 
 ---
 
