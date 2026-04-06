@@ -65,6 +65,91 @@ Every message passing through the pipeline is protected by **[guardrails-ai](htt
 
 ---
 
+## Technical Flow — What Happens When You Type a Message
+
+The diagram below traces every step from the moment you press Enter in the CLI to
+the moment the assistant's reply appears on screen.
+
+```mermaid
+flowchart TD
+    A([🧑 User types message in CLI]) --> B[main.py parses args & loads .env]
+    B --> C[AgentOrchestrator.run_cli starts]
+    C --> D[Connect to MCP server via stdio]
+    D --> E[Discover available tools via list_tools]
+    E --> F[Build system prompt + tool descriptions]
+    F --> G([🧑 Waiting for user input…])
+
+    G --> H[User enters text]
+    H --> GR1{🛡️ Guardrail 1: check_input}
+    GR1 -- "❌ Blocked: too long / injection" --> BLOCKED1([Show 'Blocked' message → back to prompt])
+    BLOCKED1 --> G
+    GR1 -- "✅ Pass" --> I[Append user message to conversation history]
+
+    I --> LOOP["⚙️ _run_agent_loop  (up to MAX_TOOL_STEPS iterations)"]
+
+    LOOP --> J[Send messages to LLM via llm.complete]
+    J --> K[LLM returns raw JSON string]
+    K --> L[Parse JSON → validate LLMDecision schema]
+    L --> DEC{Decision type?}
+
+    DEC -- "type: final" --> FINAL[Extract content from decision]
+    DEC -- "type: tool_call" --> TC_NAME[Extract tool name + arguments]
+
+    TC_NAME --> GR2{🛡️ Guardrail 2: check_tool_call}
+    GR2 -- "❌ Tool not in ALLOWED_TOOLS\nor arg too long" --> TC_ERR[Append error payload to messages]
+    TC_ERR --> LOOP
+    GR2 -- "✅ Pass" --> MCP[Call MCP tool via session.call_tool]
+
+    MCP -- "⚠️ Exception" --> MCP_ERR[Append 'Tool execution failed' to messages]
+    MCP_ERR --> LOOP
+    MCP --> TR[Extract text from MCP content blocks]
+
+    TR --> GR3{🛡️ Guardrail 3: check_tool_result}
+    GR3 -- "❌ Secrets / injection" --> TR_ERR[Append 'Tool result blocked' to messages]
+    TR_ERR --> LOOP
+    GR3 -- "✅ Pass" --> APPEND[Append tool result to messages]
+    APPEND --> LOOP
+
+    FINAL --> GR4{🛡️ Guardrail 4: check_output}
+    GR4 -- "❌ Toxic / violation" --> SAFE[Replace with safe fallback message]
+    GR4 -- "✅ Pass (may auto-truncate)" --> OK[Final answer text ready]
+    SAFE --> DISPLAY
+    OK --> DISPLAY
+
+    DISPLAY([🖥️ Display 'Assistant>' response in CLI])
+    DISPLAY --> HIST[Append assistant reply to history & trim]
+    HIST --> G
+
+    style A fill:#2196F3,color:#fff
+    style DISPLAY fill:#4CAF50,color:#fff
+    style BLOCKED1 fill:#f44336,color:#fff
+    style GR1 fill:#FF9800,color:#fff
+    style GR2 fill:#FF9800,color:#fff
+    style GR3 fill:#FF9800,color:#fff
+    style GR4 fill:#FF9800,color:#fff
+    style DEC fill:#9C27B0,color:#fff
+    style LOOP fill:#607D8B,color:#fff
+```
+
+### Step-by-step summary
+
+| # | Stage | Component | What happens |
+|---|-------|-----------|-------------|
+| 1 | **Startup** | `main.py` | Parses `--server` arg, loads `.env`, creates `AgentOrchestrator` |
+| 2 | **MCP connect** | `orchestrator.py` | Spawns MCP server subprocess over stdio, discovers tools |
+| 3 | **User input** | CLI (`rich`) | User types a message at the `You>` prompt |
+| 4 | **Input guardrail** | `guardrails.check_input()` | Validates length, runs prompt-injection detection |
+| 5 | **LLM call** | `llm/*.py` | Full conversation history sent; LLM returns a JSON decision |
+| 6 | **Decision parse** | `util.py` → `protocol.py` | JSON → `LLMDecision` (either `tool_call` or `final`) |
+| 7 | **Tool-call guardrail** | `guardrails.check_tool_call()` | Checks tool allowlist and argument lengths |
+| 8 | **MCP tool execution** | MCP `session.call_tool()` | Runs the tool on the MCP server, returns content blocks |
+| 9 | **Tool-result guardrail** | `guardrails.check_tool_result()` | Truncation, secret redaction, injection detection |
+| 10 | **Loop or finish** | `orchestrator._run_agent_loop` | Steps 5–9 repeat until the LLM returns `type: "final"` |
+| 11 | **Output guardrail** | `guardrails.check_output()` | Length check (auto-truncate), toxic language filter |
+| 12 | **Display** | CLI (`rich`) | Final answer printed as `Assistant>`, history trimmed |
+
+---
+
 ## Project Structure
 
 ```
